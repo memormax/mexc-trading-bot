@@ -1,0 +1,1999 @@
+// Глобальные переменные
+let currentSymbol = 'BTC_USDT';
+let currentPrice = 0;
+let currentBid = 0;
+let currentAsk = 0;
+let pricePrecision = 8; // Точность цены по умолчанию
+let volumePrecision = 8; // Точность объема по умолчанию
+let authTokenSet = false;
+const API_BASE_URL = window.location.origin; // Используем текущий домен
+// Хранилище цен для всех символов (для расчета PnL)
+const symbolPrices = {}; // {symbol: price}
+// Хранилище contractSize для всех символов
+const symbolContractSizes = {}; // {symbol: contractSize}
+// Ставка комиссии (fee rate)
+let feeRate = 0.0004; // По умолчанию 0.04% (0.0004)
+// Таймеры для автоматических обновлений
+let marketDataInterval = null;
+let positionsInterval = null;
+// Статус арбитражного бота (для контроля автоматических обновлений)
+// Делаем глобальной для доступа из других скриптов
+window.arbitrageBotRunning = false;
+let arbitrageBotRunning = window.arbitrageBotRunning;
+
+// API функции
+const api = {
+    async request(endpoint, options = {}) {
+        try {
+            const response = await fetch(`${API_BASE_URL}${endpoint}`, {
+                ...options,
+                headers: {
+                    'Content-Type': 'application/json',
+                    ...options.headers
+                }
+            });
+            
+            // Проверяем Content-Type перед парсингом JSON
+            const contentType = response.headers.get('content-type');
+            if (!contentType || !contentType.includes('application/json')) {
+                const text = await response.text();
+                console.error('Server returned non-JSON response:', text.substring(0, 500));
+                throw new Error(`Server returned ${contentType || 'unknown'} instead of JSON. Status: ${response.status}`);
+            }
+            
+            const data = await response.json();
+            return data;
+        } catch (error) {
+            console.error('API request error:', error);
+            throw error;
+        }
+    },
+    
+    // Auth
+    setAuthToken(token) {
+        return this.request('/api/auth/token', {
+            method: 'POST',
+            body: JSON.stringify({ token })
+        });
+    },
+    
+    testConnection() {
+        return this.request('/api/auth/test');
+    },
+    
+    // API Keys
+    setApiKeys(apiKey, apiSecret) {
+        return this.request('/api/api-keys/set', {
+            method: 'POST',
+            body: JSON.stringify({ apiKey, apiSecret })
+        });
+    },
+    
+    testApiKeys() {
+        return this.request('/api/api-keys/test');
+    },
+    
+    getTradeHistory(symbol, pageSize = 20) {
+        return this.request(`/api/trades/history?symbol=${symbol}&pageSize=${pageSize}`);
+    },
+    
+    checkCommission(orderId, symbol) {
+        return this.request(`/api/commission/check/${orderId}?symbol=${symbol}`);
+    },
+    
+    // Orders
+    submitOrder(params) {
+        return this.request('/api/orders/submit', {
+            method: 'POST',
+            body: JSON.stringify(params)
+        });
+    },
+    
+    cancelOrder(orderIds) {
+        return this.request('/api/orders/cancel', {
+            method: 'POST',
+            body: JSON.stringify(orderIds)
+        });
+    },
+    
+    cancelAllOrders(symbol) {
+        return this.request('/api/orders/cancel-all', {
+            method: 'POST',
+            body: JSON.stringify(symbol ? { symbol } : {})
+        });
+    },
+    
+    getOrderHistory(params) {
+        const query = new URLSearchParams(params).toString();
+        return this.request(`/api/orders/history?${query}`);
+    },
+    
+    // Positions
+    getOpenPositions(symbol) {
+        const url = symbol ? `/api/positions?symbol=${symbol}` : '/api/positions';
+        return this.request(url);
+    },
+    
+    // Account
+    getAccountAsset(currency) {
+        return this.request(`/api/account/asset/${currency}`);
+    },
+    
+    getFeeRate() {
+        return this.request('/api/account/fee-rate');
+    },
+    
+    // Market
+    getTicker(symbol) {
+        return this.request(`/api/market/ticker?symbol=${symbol}`);
+    },
+    
+    getContractDetail(symbol) {
+        return this.request(`/api/market/contract?symbol=${symbol}`);
+    },
+    
+    // Arbitrage bot
+    getStatus() {
+        return this.request('/api/status');
+    },
+    
+    getSpread() {
+        return this.request('/api/spread');
+    },
+    
+    getSettings() {
+        return this.request('/api/settings');
+    },
+    
+    updateSettings(settings) {
+        return this.request('/api/settings', {
+            method: 'POST',
+            body: JSON.stringify(settings)
+        });
+    },
+    
+    startBot(symbol) {
+        return this.request('/api/start', {
+            method: 'POST',
+            body: JSON.stringify(symbol ? { symbol } : {})
+        });
+    },
+    
+    stopBot() {
+        return this.request('/api/stop', {
+            method: 'POST'
+        });
+    },
+    
+    restartBot(symbol) {
+        return this.request('/api/restart', {
+            method: 'POST',
+            body: JSON.stringify(symbol ? { symbol } : {})
+        });
+    },
+    
+    // Server management
+    restartServer() {
+        return this.request('/api/server/restart', {
+            method: 'POST'
+        });
+    },
+    
+    // Arbitrage volume and leverage
+    setArbitrageVolume(volume, leverage) {
+        return this.request('/api/arbitrage/volume', {
+            method: 'POST',
+            body: JSON.stringify({ volume, leverage })
+        });
+    },
+    
+    // Position leverage
+    modifyLeverage(symbol, leverage, positionId) {
+        return this.request('/api/positions/modify-leverage', {
+            method: 'POST',
+            body: JSON.stringify({ symbol, leverage, positionId })
+        });
+    }
+};
+
+// Инициализация
+document.addEventListener('DOMContentLoaded', () => {
+    checkServerConnection();
+    
+    // Автоматическое обновление рыночных данных каждые 5 секунд
+    // НЕ обновляем, если арбитражный бот остановлен (чтобы не нагружать сервер)
+    marketDataInterval = setInterval(() => {
+        if (authTokenSet && window.arbitrageBotRunning) {
+            loadMarketData();
+        }
+    }, 5000);
+    
+    // Автоматическое обновление позиций каждые 3 секунды для обновления PnL
+    // НЕ обновляем, если арбитражный бот остановлен
+    positionsInterval = setInterval(() => {
+        if (authTokenSet && window.arbitrageBotRunning) {
+            loadPositions();
+        }
+    }, 3000);
+});
+
+// Остановка всех автоматических обновлений
+function stopAllAutoUpdates() {
+    window.arbitrageBotRunning = false;
+    arbitrageBotRunning = false;
+    
+    // НЕ очищаем интервалы, просто отключаем их работу через флаг
+    // Это позволяет легко включить их обратно при запуске бота
+    
+    // Останавливаем автообновления арбитража
+    if (typeof stopArbitrageAutoUpdate === 'function') {
+        stopArbitrageAutoUpdate();
+    }
+}
+
+// Запуск всех автоматических обновлений
+function startAllAutoUpdates() {
+    window.arbitrageBotRunning = true;
+    arbitrageBotRunning = true;
+    
+    // Интервалы уже запущены при загрузке страницы, просто включаем их работу
+    // Они будут работать только если arbitrageBotRunning = true
+}
+
+// Проверка подключения к серверу
+async function checkServerConnection() {
+    try {
+        const result = await api.request('/api/health');
+        if (result.status === 'ok') {
+            updateConnectionStatus(true);
+        } else {
+            updateConnectionStatus(false);
+        }
+    } catch (error) {
+        updateConnectionStatus(false);
+        log('❌ Не удалось подключиться к серверу', 'error');
+    }
+}
+
+// Утилиты для работы с логом
+function log(message, type = 'info') {
+    const logDiv = document.getElementById('log');
+    if (!logDiv) return;
+    
+    const entry = document.createElement('div');
+    entry.className = `log-entry ${type}`;
+    const timestamp = new Date().toLocaleTimeString();
+    entry.textContent = `[${timestamp}] ${message}`;
+    logDiv.appendChild(entry);
+    logDiv.scrollTop = logDiv.scrollHeight;
+}
+
+function clearLog() {
+    const logDiv = document.getElementById('log');
+    if (logDiv) {
+        logDiv.innerHTML = '';
+        log('Лог очищен', 'info');
+    }
+}
+
+// Управление токеном
+function toggleTokenVisibility() {
+    const input = document.getElementById('authToken');
+    const btn = event.target;
+    if (input.type === 'password') {
+        input.type = 'text';
+        btn.textContent = '🙈';
+    } else {
+        input.type = 'password';
+        btn.textContent = '👁️';
+    }
+}
+
+async function setAuthToken() {
+    let token = document.getElementById('authToken').value;
+    
+    // Очистка токена от всех недопустимых символов
+    token = token.trim()
+        .replace(/\s+/g, '')
+        .replace(/\r\n/g, '')
+        .replace(/\n/g, '')
+        .replace(/\r/g, '')
+        .replace(/\t/g, '');
+    
+    if (!token) {
+        log('❌ Пожалуйста, введите WEB токен', 'error');
+        return;
+    }
+    
+    if (!token.startsWith('WEB_')) {
+        log('⚠️ Предупреждение: Токен должен начинаться с "WEB_"', 'warning');
+    }
+    
+    log(`Установка токена авторизации (длина: ${token.length} символов)...`, 'info');
+    log(`Первые 30 символов: ${token.substring(0, 30)}...`, 'info');
+    
+    try {
+        const result = await api.setAuthToken(token);
+        if (result.success) {
+            authTokenSet = true;
+            updateConnectionStatus(true);
+            log('✅ Токен успешно установлен и сохранен на сервере', 'info');
+        } else {
+            log(`❌ Ошибка установки токена: ${result.error}`, 'error');
+        }
+    } catch (error) {
+        log(`❌ Ошибка: ${error.message}`, 'error');
+    }
+}
+
+async function testConnection() {
+    log('Проверка подключения...', 'info');
+    try {
+        const result = await api.testConnection();
+        if (result.success) {
+            updateConnectionStatus(true);
+            log('✅ Подключение успешно!', 'info');
+        } else {
+            updateConnectionStatus(false);
+            log(`❌ Ошибка подключения: ${result.error}`, 'error');
+        }
+    } catch (error) {
+        updateConnectionStatus(false);
+        log(`❌ Ошибка: ${error.message}`, 'error');
+    }
+}
+
+function updateConnectionStatus(connected) {
+    const status = document.getElementById('connectionStatus');
+    if (!status) return;
+    
+    const dot = status.querySelector('.status-dot');
+    const text = status.querySelector('span:last-child');
+    
+    if (connected) {
+        if (dot) dot.classList.add('connected');
+        if (text) text.textContent = 'Подключено';
+    } else {
+        if (dot) dot.classList.remove('connected');
+        if (text) text.textContent = 'Не подключено';
+    }
+}
+
+// Рыночные данные
+function getSelectedSymbol() {
+    const select = document.getElementById('symbol');
+    const custom = document.getElementById('customSymbol');
+    const customValue = custom ? custom.value.trim() : '';
+    return customValue || (select ? select.value : 'BTC_USDT');
+}
+
+async function loadMarketData() {
+    const symbol = getSelectedSymbol();
+    if (!symbol) {
+        return;
+    }
+
+    currentSymbol = symbol;
+    
+    if (!authTokenSet) {
+        log('⚠️ Токен не установлен, не могу загрузить рыночные данные', 'warning');
+        return;
+    }
+    
+    try {
+        const result = await api.getTicker(symbol);
+        if (result.success && result.data) {
+            // Проверяем структуру ответа
+            let ticker = null;
+            if (result.data.data && typeof result.data.data === 'object') {
+                ticker = result.data.data;
+            } else if (result.data && typeof result.data === 'object') {
+                ticker = result.data;
+            }
+            
+            if (!ticker) {
+                log(`❌ Нет данных тикера для ${symbol}`, 'error');
+                return;
+            }
+            
+            // Безопасное получение цены
+            if (ticker.lastPrice !== undefined && ticker.lastPrice !== null) {
+                currentPrice = parseFloat(ticker.lastPrice) || 0;
+            } else {
+                currentPrice = 0;
+                log(`⚠️ Цена не найдена в данных для ${symbol}`, 'warning');
+            }
+            
+            // Сохраняем bid и ask для Market ордеров (без логирования)
+            if (ticker.bid1 !== undefined && ticker.bid1 !== null) {
+                currentBid = parseFloat(ticker.bid1) || 0;
+            }
+            if (ticker.ask1 !== undefined && ticker.ask1 !== null) {
+                currentAsk = parseFloat(ticker.ask1) || 0;
+            }
+            
+            // Сохраняем цену для этого символа (для расчета PnL)
+            if (currentPrice > 0) {
+                symbolPrices[symbol] = currentPrice;
+            }
+            
+            displayMarketData(ticker);
+            
+            // Загружаем информацию о контракте для получения точности (без логирования)
+            await loadContractDetail(symbol);
+            
+            // Логируем только при первой загрузке или при смене символа
+            if (!window.lastSymbol || window.lastSymbol !== symbol) {
+                log(`✅ Рыночные данные загружены для ${symbol}`, 'info');
+                window.lastSymbol = symbol;
+            }
+            
+            // Обновляем расчеты объема, если они есть
+            if (document.getElementById('volume')?.value) {
+                updateVolumeCalculations();
+            }
+        } else {
+            log(`❌ Ошибка загрузки данных: ${result.error}`, 'error');
+        }
+    } catch (error) {
+        log(`❌ Ошибка: ${error.message}`, 'error');
+    }
+}
+
+function displayMarketData(ticker) {
+    const div = document.getElementById('marketData');
+    if (!div) return;
+    
+    const change = (ticker.riseFallRate || 0) * 100;
+    const changeClass = change >= 0 ? 'price-positive' : 'price-negative';
+    
+    div.innerHTML = `
+        <div class="market-data-item">
+            <strong>Цена:</strong>
+            <span class="${changeClass}">$${parseFloat(ticker.lastPrice || 0).toLocaleString('ru-RU', {minimumFractionDigits: 2, maximumFractionDigits: 8})}</span>
+        </div>
+        <div class="market-data-item">
+            <strong>24ч Изменение:</strong>
+            <span class="${changeClass}">${change.toFixed(2)}%</span>
+        </div>
+        <div class="market-data-item">
+            <strong>24ч Объем:</strong>
+            <span>${parseFloat(ticker.volume24 || 0).toLocaleString('ru-RU')}</span>
+        </div>
+        <div class="market-data-item">
+            <strong>Открытый интерес:</strong>
+            <span>${parseFloat(ticker.holdVol || 0).toLocaleString('ru-RU')}</span>
+        </div>
+        <div class="market-data-item">
+            <strong>Funding Rate:</strong>
+            <span>${(ticker.fundingRate || 0).toFixed(6)}</span>
+        </div>
+        <div class="market-data-item">
+            <strong>Bid:</strong>
+            <span>$${parseFloat(ticker.bid1 || 0).toLocaleString('ru-RU', {minimumFractionDigits: 2, maximumFractionDigits: 8})}</span>
+        </div>
+        <div class="market-data-item">
+            <strong>Ask:</strong>
+            <span>$${parseFloat(ticker.ask1 || 0).toLocaleString('ru-RU', {minimumFractionDigits: 2, maximumFractionDigits: 8})}</span>
+        </div>
+    `;
+}
+
+// Загрузка информации о контракте для получения точности
+async function loadContractDetail(symbol) {
+    if (!authTokenSet) {
+        return;
+    }
+    
+    try {
+        const result = await api.getContractDetail(symbol);
+        
+        if (result.success && result.data) {
+            // result.data может быть объектом или массивом
+            // Также может быть вложенная структура: result.data.data
+            let contractData = result.data;
+            
+            // Проверяем вложенную структуру (data.data)
+            if (contractData.data && typeof contractData.data === 'object') {
+                contractData = contractData.data;
+            }
+            
+            // Если это массив, ищем нужный контракт
+            let contract = null;
+            if (Array.isArray(contractData)) {
+                contract = contractData.find(c => c.symbol === symbol);
+            } else if (contractData.symbol === symbol || !contractData.symbol) {
+                contract = contractData;
+            }
+            
+            if (contract) {
+                // Получаем точность из контракта
+                if (contract.priceScale !== undefined && contract.priceScale !== null) {
+                    pricePrecision = parseInt(contract.priceScale);
+                }
+                
+                if (contract.volScale !== undefined && contract.volScale !== null) {
+                    volumePrecision = parseInt(contract.volScale);
+                }
+                
+                // Сохраняем contractSize для расчета PnL
+                if (contract.contractSize !== undefined && contract.contractSize !== null) {
+                    symbolContractSizes[symbol] = parseFloat(contract.contractSize) || 1;
+                } else {
+                    symbolContractSizes[symbol] = 1; // По умолчанию
+                }
+                
+                // Сохраняем точность для использования
+                window.lastPricePrecision = pricePrecision;
+                window.lastVolumePrecision = volumePrecision;
+                
+                console.log('Contract precision:', { priceScale: contract.priceScale, volScale: contract.volScale, pricePrecision, volumePrecision });
+            }
+        }
+    } catch (error) {
+        // Игнорируем ошибки, используем значения по умолчанию
+        console.warn('Failed to load contract detail, using defaults:', error);
+    }
+}
+
+function setCurrentPrice() {
+    if (currentPrice > 0) {
+        const priceInput = document.getElementById('price');
+        if (priceInput) {
+            const roundedPrice = parseFloat(currentPrice.toFixed(pricePrecision));
+            priceInput.value = roundedPrice;
+            log(`✅ Цена установлена: $${roundedPrice} (precision: ${pricePrecision})`, 'info');
+        }
+    } else {
+        log('⚠️ Сначала загрузите рыночные данные', 'warning');
+    }
+}
+
+// Функция для округления до нужной точности
+function roundToPrecision(value, precision) {
+    if (precision === 0) {
+        return Math.round(value);
+    }
+    const factor = Math.pow(10, precision);
+    const rounded = Math.round(value * factor) / factor;
+    return parseFloat(rounded.toFixed(precision));
+}
+
+// Обновление подсказок
+function updateOrderSideHint() {
+    const side = parseInt(document.getElementById('orderSide').value);
+    const hint = document.getElementById('orderHint');
+    if (!hint) return;
+    
+    const hints = {
+        1: 'Открытие длинной позиции (покупка)',
+        3: 'Открытие короткой позиции (продажа)',
+        4: 'Закрытие длинной позиции',
+        2: 'Закрытие короткой позиции'
+    };
+    hint.textContent = hints[side] || '';
+}
+
+function updateOrderTypeHint() {
+    const type = parseInt(document.getElementById('orderType').value);
+    const hint = document.getElementById('orderHint');
+    if (!hint) return;
+    
+    const hints = {
+        5: 'Market: исполнение по текущей рыночной цене',
+        1: 'Limit: исполнение только по указанной цене',
+        3: 'IOC: исполнить немедленно или отменить',
+        4: 'FOK: исполнить полностью или отменить',
+        2: 'Post Only: только как maker (без комиссии taker)',
+        6: 'Convert: конвертация'
+    };
+    hint.textContent = hints[type] || '';
+}
+
+// Обновление типа объема
+function updateVolumeType() {
+    const volumeType = document.querySelector('input[name="volumeType"]:checked')?.value || 'usdt';
+    const volumeUnit = document.getElementById('volumeUnit');
+    if (volumeUnit) {
+        volumeUnit.textContent = volumeType === 'usdt' ? 'USDT' : getSelectedSymbol().split('_')[0];
+    }
+    updateVolumeCalculations();
+}
+
+// Обновление расчетов объема
+function updateVolumeCalculations() {
+    const volumeInput = parseFloat(document.getElementById('volume')?.value || 0);
+    const volumeType = document.querySelector('input[name="volumeType"]:checked')?.value || 'usdt';
+    const leverage = parseInt(document.getElementById('leverage')?.value || 1);
+    const price = parseFloat(document.getElementById('price')?.value || currentPrice || 0);
+    const type = parseInt(document.getElementById('orderType')?.value || 5);
+    
+    const calcDiv = document.getElementById('volumeCalculations');
+    if (!calcDiv) return;
+    
+    if (volumeInput <= 0 || !price) {
+        calcDiv.innerHTML = '<div>Расчеты появятся после ввода объема и цены</div>';
+        return;
+    }
+    
+    // Для Market ордеров используем текущую цену
+    const priceForCalc = type === 5 ? currentPrice : price;
+    
+    let volumeInCoins = volumeInput;
+    let volumeInUsdt = volumeInput;
+    
+    if (volumeType === 'usdt') {
+        volumeInCoins = priceForCalc > 0 ? volumeInput / priceForCalc : 0;
+        volumeInUsdt = volumeInput;
+    } else {
+        volumeInCoins = volumeInput;
+        volumeInUsdt = priceForCalc > 0 ? volumeInput * priceForCalc : 0;
+    }
+    
+    const margin = volumeInUsdt / leverage;
+    
+    calcDiv.innerHTML = `
+        <div><strong>Объем:</strong> ${volumeInCoins.toFixed(6)} ${getSelectedSymbol().split('_')[0]} (${volumeInUsdt.toFixed(2)} USDT)</div>
+        <div><strong>Маржа:</strong> ${margin.toFixed(2)} USDT</div>
+        <div><strong>Плечо:</strong> ${leverage}x</div>
+    `;
+    
+    // Отправляем объем и плечо на сервер для арбитража (если выбран USDT)
+    // НЕ отправляем, если бот остановлен (чтобы не нагружать сервер)
+    if (volumeType === 'usdt' && volumeInUsdt > 0 && window.arbitrageBotRunning) {
+        const leverage = parseInt(document.getElementById('leverage')?.value || 10);
+        api.setArbitrageVolume(volumeInUsdt, leverage).then(result => {
+            if (result.success) {
+                // Параметры обновлены для арбитража
+            }
+        }).catch(err => {
+            // Игнорируем ошибки, так как это не критично
+        });
+    }
+}
+
+// Установка процента объема
+function setVolumePercent(percent) {
+    // Эта функция требует баланс, пока просто логируем
+    log(`Установка ${percent}% объема (требуется баланс)`, 'info');
+}
+
+// Применение плеча
+async function applyLeverage() {
+    if (!authTokenSet) {
+        log('❌ Сначала установите токен авторизации', 'error');
+        return;
+    }
+    
+    const symbol = getSelectedSymbol();
+    const leverage = parseInt(document.getElementById('leverage')?.value || 1);
+    
+    if (!leverage || leverage < 1) {
+        log('❌ Введите корректное плечо (минимум 1x)', 'error');
+        return;
+    }
+    
+    if (!symbol) {
+        log('❌ Выберите символ', 'error');
+        return;
+    }
+    
+    log(`⚙️ Применение плеча ${leverage}x для ${symbol}...`, 'info');
+    
+    try {
+        // Сначала проверяем, есть ли открытая позиция
+        const positionsResult = await api.getOpenPositions(symbol);
+        let positionId = null;
+        
+        if (positionsResult.success && positionsResult.data) {
+            let positions = positionsResult.data;
+            if (positions.data && Array.isArray(positions.data)) {
+                positions = positions.data;
+            } else if (Array.isArray(positions)) {
+                // Уже массив
+            } else {
+                positions = [];
+            }
+            
+            // Ищем позицию для этого символа
+            const position = positions.find((p) => p.symbol === symbol);
+            if (position && position.positionId) {
+                positionId = position.positionId;
+                log(`📊 Найдена открытая позиция (ID: ${positionId}), текущее плечо: ${position.leverage || 'неизвестно'}x`, 'info');
+            }
+        }
+        
+        // Отправляем запрос на изменение плеча
+        const result = await api.modifyLeverage(symbol, leverage, positionId);
+        
+        if (result.success) {
+            log(`✅ Плечо успешно изменено на ${leverage}x для ${symbol}`, 'info');
+            
+            // Обновляем позиции, если они были открыты
+            if (positionId) {
+                loadPositions();
+            }
+        } else {
+            log(`❌ Ошибка изменения плеча: ${result.error}`, 'error');
+        }
+    } catch (error) {
+        log(`❌ Ошибка: ${error.message}`, 'error');
+        console.error('Modify leverage error:', error);
+        
+        // Если endpoint не найден, просто сохраняем плечо для будущих ордеров
+        if (error.message && error.message.includes('not found')) {
+            log(`⚠️ Endpoint для изменения плеча не найден. Плечо ${leverage}x будет использовано для новых ордеров.`, 'warning');
+        }
+    }
+}
+
+// Быстрые действия
+// Быстрый лонг - открывает позицию с текущими параметрами
+async function quickLong() {
+    if (!authTokenSet) {
+        log('❌ Сначала установите токен авторизации', 'error');
+        return;
+    }
+    
+    const volumeInput = parseFloat(document.getElementById('volume')?.value || 0);
+    if (!volumeInput || volumeInput <= 0) {
+        log('❌ Введите объем перед открытием позиции', 'error');
+        return;
+    }
+    
+    // Устанавливаем параметры для лонга
+    document.getElementById('orderSide').value = '1';
+    document.getElementById('orderType').value = '5'; // Market
+    document.getElementById('openType').value = '1'; // Isolated
+    updateOrderSideHint();
+    updateOrderTypeHint();
+    
+    // Отправляем ордер
+    await submitOrder();
+}
+
+// Быстрый шорт - открывает позицию с текущими параметрами
+async function quickShort() {
+    if (!authTokenSet) {
+        log('❌ Сначала установите токен авторизации', 'error');
+        return;
+    }
+    
+    const volumeInput = parseFloat(document.getElementById('volume')?.value || 0);
+    if (!volumeInput || volumeInput <= 0) {
+        log('❌ Введите объем перед открытием позиции', 'error');
+        return;
+    }
+    
+    // Устанавливаем параметры для шорта
+    document.getElementById('orderSide').value = '3';
+    document.getElementById('orderType').value = '5'; // Market
+    document.getElementById('openType').value = '1'; // Isolated
+    updateOrderSideHint();
+    updateOrderTypeHint();
+    
+    // Отправляем ордер
+    await submitOrder();
+}
+
+async function quickClose() {
+    if (!authTokenSet) {
+        log('❌ Сначала установите токен авторизации', 'error');
+        return;
+    }
+    
+    const symbol = getSelectedSymbol();
+    if (!symbol) {
+        log('❌ Выберите символ', 'error');
+        return;
+    }
+    
+    try {
+        // Загружаем открытые позиции
+        const positionsResult = await api.getOpenPositions(symbol);
+        if (!positionsResult.success || !positionsResult.data) {
+            log('❌ Не удалось загрузить позиции', 'error');
+            return;
+        }
+        
+        let positions = positionsResult.data;
+        if (positions.data && Array.isArray(positions.data)) {
+            positions = positions.data;
+        } else if (Array.isArray(positions)) {
+            // Уже массив
+        } else {
+            positions = [];
+        }
+        
+        // Ищем позицию для этого символа
+        const position = positions.find((p) => p.symbol === symbol);
+        
+        if (!position) {
+            log(`❌ Нет открытой позиции для ${symbol}`, 'error');
+            return;
+        }
+        
+        // Определяем тип позиции и объём
+        const positionType = position.positionType; // 1 = LONG, 2 = SHORT
+        const positionVolume = parseFloat(position.holdVol || 0);
+        const positionLeverage = parseInt(position.leverage || 1);
+        const positionId = position.positionId;
+        
+        if (positionVolume <= 0) {
+            log('❌ Объём позиции равен нулю', 'error');
+            return;
+        }
+        
+        // Определяем направление закрытия
+        // Если лонг (1) - закрываем лонг (side=4)
+        // Если шорт (2) - закрываем шорт (side=2)
+        const closeSide = positionType === 1 ? 4 : 2;
+        const sideText = positionType === 1 ? 'Закрыть лонг' : 'Закрыть шорт';
+        
+        log(`📊 Найдена позиция: ${positionType === 1 ? 'LONG' : 'SHORT'}, объём: ${positionVolume} ${symbol.split('_')[0]}, плечо: ${positionLeverage}x`, 'info');
+        
+        // Загружаем информацию о контракте для получения точности
+        let volScale = volumePrecision;
+        try {
+            const contractResult = await api.getContractDetail(symbol);
+            if (contractResult.success && contractResult.data) {
+                let contractData = contractResult.data;
+                if (contractData.data && typeof contractData.data === 'object') {
+                    contractData = contractData.data;
+                }
+                
+                let contract = null;
+                if (Array.isArray(contractData)) {
+                    contract = contractData.find(c => c.symbol === symbol);
+                } else if (contractData.symbol === symbol || !contractData.symbol) {
+                    contract = contractData;
+                }
+                
+                if (contract && contract.volScale !== undefined) {
+                    volScale = parseInt(contract.volScale);
+                }
+            }
+        } catch (error) {
+            console.warn('Failed to load contract detail:', error);
+        }
+        
+        // Округляем объём до правильной точности
+        const volume = parseFloat(positionVolume.toFixed(volScale));
+        
+        // Получаем текущую цену для Market ордера
+        if (currentPrice <= 0) {
+            await loadMarketData();
+            if (currentPrice <= 0) {
+                log('❌ Не удалось получить текущую цену. Обновите рыночные данные.', 'error');
+                return;
+            }
+        }
+        
+        const price = currentPrice;
+        let priceScale = pricePrecision;
+        try {
+            const contractResult = await api.getContractDetail(symbol);
+            if (contractResult.success && contractResult.data) {
+                let contractData = contractResult.data;
+                if (contractData.data && typeof contractData.data === 'object') {
+                    contractData = contractData.data;
+                }
+                
+                let contract = null;
+                if (Array.isArray(contractData)) {
+                    contract = contractData.find(c => c.symbol === symbol);
+                } else if (contractData.symbol === symbol || !contractData.symbol) {
+                    contract = contractData;
+                }
+                
+                if (contract && contract.priceScale !== undefined) {
+                    priceScale = parseInt(contract.priceScale);
+                }
+            }
+        } catch (error) {
+            console.warn('Failed to load contract detail:', error);
+        }
+        
+        const roundedPrice = parseFloat(price.toFixed(priceScale));
+        
+        // Формируем параметры ордера для закрытия
+        const orderParams = {
+            symbol,
+            price: roundedPrice,
+            vol: volume,
+            side: closeSide,
+            type: 5, // Market ордер
+            openType: 1, // Isolated
+            leverage: positionLeverage,
+            positionId: positionId
+        };
+        
+        // Отправляем ордер
+        const result = await api.submitOrder(orderParams);
+        
+        if (result.success) {
+            const orderData = result.data;
+            let orderId = null;
+            
+            if (typeof orderData === 'number') {
+                orderId = orderData;
+            } else if (orderData && typeof orderData === 'object') {
+                if (orderData.success === false) {
+                    const errorMsg = orderData.message || `Code: ${orderData.code}`;
+                    log(`❌ Ошибка закрытия позиции: ${errorMsg}`, 'error');
+                    return;
+                }
+                orderId = orderData.data || orderData.orderId || orderData.id;
+            }
+            
+            if (orderId) {
+                log(`✅ Позиция успешно закрыта! Order ID: ${orderId}`, 'info');
+                // Небольшая задержка перед обновлением, чтобы данные успели обновиться на сервере
+                setTimeout(async () => {
+                    await loadPositions();
+                    await refreshBalance();
+                    // Обновляем историю сделок после закрытия
+                    await loadTradeHistory();
+                }, 2000); // Увеличиваем задержку до 2 секунд для истории
+            } else {
+                log(`⚠️ Ордер отправлен, но Order ID не получен. Проверьте позиции.`, 'warning');
+                setTimeout(async () => {
+                    await loadPositions();
+                    await refreshBalance();
+                    // Обновляем историю сделок после закрытия
+                    await loadTradeHistory();
+                }, 2000);
+            }
+        } else {
+            const errorMsg = result.error || result.originalError || 'Unknown error';
+            log(`❌ Ошибка закрытия позиции: ${errorMsg}`, 'error');
+        }
+    } catch (error) {
+        log(`❌ Ошибка: ${error.message}`, 'error');
+        console.error('Quick close error:', error);
+    }
+}
+
+// Торговые операции - простая логика как в SDK
+async function submitOrder() {
+    if (!authTokenSet) {
+        log('❌ Сначала установите токен авторизации', 'error');
+        return;
+    }
+
+    const symbol = getSelectedSymbol();
+    const side = parseInt(document.getElementById('orderSide').value);
+    const type = parseInt(document.getElementById('orderType').value);
+    const openType = parseInt(document.getElementById('openType').value);
+    let leverage = parseInt(document.getElementById('leverage').value);
+    
+    // Получаем объем и тип
+    const volumeType = document.querySelector('input[name="volumeType"]:checked')?.value || 'usdt';
+    const volumeInput = parseFloat(document.getElementById('volume').value);
+    
+    if (!volumeInput || volumeInput <= 0) {
+        log('❌ Введите корректный объем', 'error');
+        return;
+    }
+    
+    if (!symbol) {
+        log('❌ Выберите символ', 'error');
+        return;
+    }
+    
+    // ВАЖНО: Логика использования плеча:
+    // - Для ОТКРЫТИЯ новой позиции (side 1 или 3) - используем ВЫБРАННОЕ плечо
+    // - Для ЗАКРЫТИЯ позиции (side 2 или 4) - используем плечо СУЩЕСТВУЮЩЕЙ позиции
+    let actualLeverage = leverage;
+    let existingPosition = null;
+    const isOpeningNew = side === 1 || side === 3; // Открытие новой позиции
+    const isClosing = side === 2 || side === 4; // Закрытие позиции
+    
+    if (isClosing) {
+        // При закрытии используем плечо существующей позиции
+        try {
+            const positionsResult = await api.getOpenPositions(symbol);
+            if (positionsResult.success && positionsResult.data) {
+                let positions = positionsResult.data;
+                if (positions.data && Array.isArray(positions.data)) {
+                    positions = positions.data;
+                } else if (Array.isArray(positions)) {
+                    // Уже массив
+                } else {
+                    positions = [];
+                }
+                
+                // Ищем позицию для этого символа
+                existingPosition = positions.find((p) => p.symbol === symbol);
+                
+                if (existingPosition && existingPosition.leverage) {
+                    // Используем плечо существующей позиции для закрытия
+                    actualLeverage = parseInt(existingPosition.leverage);
+                    log(`📊 Используем плечо существующей позиции: ${actualLeverage}x для закрытия`, 'info');
+                }
+            }
+        } catch (error) {
+            console.warn('Failed to check existing positions for closing:', error);
+            // Продолжаем с выбранным плечом
+        }
+    } else if (isOpeningNew) {
+        // При открытии новой позиции используем ВЫБРАННОЕ плечо
+        // Но проверяем, есть ли уже позиция с другим плечом
+        try {
+            const positionsResult = await api.getOpenPositions(symbol);
+            if (positionsResult.success && positionsResult.data) {
+                let positions = positionsResult.data;
+                if (positions.data && Array.isArray(positions.data)) {
+                    positions = positions.data;
+                } else if (Array.isArray(positions)) {
+                    // Уже массив
+                } else {
+                    positions = [];
+                }
+                
+                existingPosition = positions.find((p) => p.symbol === symbol);
+                
+                if (existingPosition && existingPosition.leverage) {
+                    const existingLeverage = parseInt(existingPosition.leverage);
+                    if (existingLeverage !== leverage) {
+                        log(`⚠️ Внимание: У вас уже есть позиция с плечом ${existingLeverage}x, а вы пытаетесь открыть с ${leverage}x`, 'warning');
+                        log(`💡 Совет: Сначала измените плечо через кнопку "Применить", или закройте существующую позицию`, 'info');
+                        // НЕ меняем плечо автоматически, используем выбранное пользователем
+                    }
+                }
+            }
+        } catch (error) {
+            console.warn('Failed to check existing positions for opening:', error);
+            // Продолжаем с выбранным плечом
+        }
+        
+        // Для открытия новой позиции всегда используем выбранное плечо
+        actualLeverage = leverage;
+    }
+    
+    if (openType === 1 && (!actualLeverage || actualLeverage < 1)) {
+        log('❌ Для изолированной маржи требуется плечо', 'error');
+        return;
+    }
+    
+    // Получаем цену
+    let price = 0;
+    if (type === 5) {
+        // Market ордер - используем текущую цену (как в примере SDK)
+        if (currentPrice <= 0) {
+            log('❌ Не удалось получить текущую цену. Обновите рыночные данные.', 'error');
+            return;
+        }
+        price = currentPrice;
+    } else {
+        // Limit ордер - берем цену из поля ввода
+        price = parseFloat(document.getElementById('price').value);
+        if (!price || price <= 0) {
+            log('❌ Введите корректную цену для Limit ордера', 'error');
+            return;
+        }
+    }
+    
+    // Конвертируем объем в коины, если указан в USDT
+    // ВАЖНО: vol в API - это объем в КОИНАХ, не в USDT!
+    // MEXC рассчитывает маржу как: (vol * price * contractSize) / leverage
+    // Если пользователь вводит 100 USDT с плечом 10x:
+    // - volume = 100 / price (коины)
+    // - vol для API = volume / contractSize
+    // - Маржа = (vol * price * contractSize) / 10 = 100 / 10 = 10 USDT
+    let volume = volumeInput;
+    let volumeInUsdt = volumeInput;
+    
+    if (volumeType === 'usdt') {
+        // Пользователь ввел объем в USDT - конвертируем в коины
+        const priceForVolume = type === 5 ? currentPrice : price;
+        if (priceForVolume <= 0) {
+            log('❌ Не удалось определить цену для расчета объема.', 'error');
+            return;
+        }
+        volumeInUsdt = volumeInput; // Объем позиции в USDT (уже с учетом плеч)
+        volume = volumeInput / priceForVolume; // Конвертируем в коины для API
+    } else {
+        // Пользователь ввел объем в коинах - конвертируем в USDT для расчета маржи
+        const priceForVolume = type === 5 ? currentPrice : price;
+        if (priceForVolume <= 0) {
+            log('❌ Не удалось определить цену для расчета объема.', 'error');
+            return;
+        }
+        volume = volumeInput; // Уже в коинах
+        volumeInUsdt = volumeInput * priceForVolume; // Конвертируем в USDT
+    }
+    
+    // Рассчитываем требуемую маржу (используем актуальное плечо)
+    const requiredMargin = volumeInUsdt / actualLeverage;
+    
+    // Загружаем информацию о контракте для получения точности
+    let priceScale = pricePrecision; // Используем сохраненное значение
+    let volScale = volumePrecision; // Используем сохраненное значение
+    
+    try {
+        const contractResult = await api.getContractDetail(symbol);
+        if (contractResult.success && contractResult.data) {
+            let contractData = contractResult.data;
+            // Проверяем вложенную структуру
+            if (contractData.data && typeof contractData.data === 'object') {
+                contractData = contractData.data;
+            }
+            
+            // Если это массив, ищем нужный контракт
+            let contract = null;
+            if (Array.isArray(contractData)) {
+                contract = contractData.find(c => c.symbol === symbol);
+            } else if (contractData.symbol === symbol || !contractData.symbol) {
+                contract = contractData;
+            }
+            
+            if (contract) {
+                if (contract.priceScale !== undefined && contract.priceScale !== null) {
+                    priceScale = parseInt(contract.priceScale);
+                }
+                if (contract.volScale !== undefined && contract.volScale !== null) {
+                    volScale = parseInt(contract.volScale);
+                }
+                console.log(`Order precision: priceScale=${priceScale}, volScale=${volScale}`);
+                console.log(`Contract details:`, {
+                    contractSize: contract.contractSize,
+                    volUnit: contract.volUnit,
+                    priceUnit: contract.priceUnit,
+                    minVol: contract.minVol,
+                    maxVol: contract.maxVol
+                });
+            }
+        }
+    } catch (error) {
+        console.warn('Failed to load contract detail for order, using cached values:', error);
+    }
+    
+    // Округляем цену до правильной точности из контракта
+    price = parseFloat(price.toFixed(priceScale));
+    
+    // ВАЖНО: Проверяем contractSize и volUnit для правильного расчета объема
+    // contractSize - размер контракта (обычно 1 для USDT контрактов)
+    // volUnit - минимальный шаг объема
+    let contractSize = 1;
+    let volUnit = 0;
+    
+    try {
+        const contractResult = await api.getContractDetail(symbol);
+        if (contractResult.success && contractResult.data) {
+            let contractData = contractResult.data;
+            if (contractData.data && typeof contractData.data === 'object') {
+                contractData = contractData.data;
+            }
+            
+            let contract = null;
+            if (Array.isArray(contractData)) {
+                contract = contractData.find(c => c.symbol === symbol);
+            } else if (contractData.symbol === symbol || !contractData.symbol) {
+                contract = contractData;
+            }
+            
+            if (contract) {
+                if (contract.contractSize !== undefined && contract.contractSize !== null) {
+                    contractSize = parseFloat(contract.contractSize);
+                }
+                if (contract.volUnit !== undefined && contract.volUnit !== null) {
+                    volUnit = parseFloat(contract.volUnit);
+                }
+                console.log(`Contract size info: contractSize=${contractSize}, volUnit=${volUnit}`);
+            }
+        }
+    } catch (error) {
+        console.warn('Failed to check contract size:', error);
+    }
+    
+    // ВАЖНО: Правильная интерпретация vol для MEXC Futures!
+    // contractSize = 100 для DOGE_USDT означает, что vol должен быть в единицах контрактов
+    // Формула: vol = (объем в коинах) / contractSize
+    // 
+    // Пример:
+    // - Пользователь вводит 777 USDT
+    // - Объем в коинах = 777 / 0.12825 = 6058.48 DOGE
+    // - vol для API = 6058.48 / 100 = 60.58 (округляем до 61)
+    // - Размер позиции = 61 * 0.12825 * 100 = 781.325 USDT (почти 777$)
+    
+    let finalVolume = volume;
+    
+    // ВАЖНО: Делим на contractSize, если contractSize != 1
+    if (contractSize !== 1 && contractSize > 0) {
+        finalVolume = volume / contractSize;
+        console.log(`Volume adjustment for contractSize: ${volume} / ${contractSize} = ${finalVolume}`);
+    }
+    
+    // Округляем до ближайшего кратного volUnit
+    if (volUnit > 0) {
+        finalVolume = Math.round(finalVolume / volUnit) * volUnit;
+        if (finalVolume < volUnit) {
+            finalVolume = volUnit; // Минимальный объем
+        }
+        console.log(`Volume adjustment for volUnit: -> ${finalVolume} (volUnit: ${volUnit})`);
+    }
+    
+    // Округляем до точности volScale
+    volume = parseFloat(finalVolume.toFixed(volScale));
+    
+    // Проверка: рассчитываем ожидаемый размер позиции
+    // Размер позиции = vol * price * contractSize
+    const expectedPositionSize = volume * price * contractSize;
+    console.log(`Volume calculation check:`, {
+        userInput: volumeInput,
+        volumeType: volumeType,
+        volumeInCoins: volumeInput / price,
+        volumeInContracts: volume,
+        contractSize: contractSize,
+        price: price,
+        expectedPositionSize: expectedPositionSize,
+        volUnit: volUnit
+    });
+    
+    // Дополнительные параметры
+    const positionId = document.getElementById('positionId').value;
+    const externalOid = document.getElementById('externalOid').value;
+    const stopLossPrice = document.getElementById('stopLossPrice').value;
+    const takeProfitPrice = document.getElementById('takeProfitPrice').value;
+    const positionMode = document.getElementById('positionMode').value;
+    const reduceOnly = document.getElementById('reduceOnly').checked;
+    
+    // Формируем параметры ордера как в SDK (просто числа, без форматирования)
+    const orderParams = {
+        symbol,
+        price: price,
+        vol: volume,
+        side,
+        type,
+        openType,
+        leverage: openType === 1 ? actualLeverage : undefined,
+        positionId: positionId ? parseInt(positionId) : undefined,
+        externalOid: externalOid || undefined,
+        stopLossPrice: stopLossPrice ? parseFloat(stopLossPrice) : undefined,
+        takeProfitPrice: takeProfitPrice ? parseFloat(takeProfitPrice) : undefined,
+        positionMode: positionMode ? parseInt(positionMode) : undefined,
+        reduceOnly: reduceOnly || undefined
+    };
+    
+    // Удаляем undefined значения
+    Object.keys(orderParams).forEach(key => {
+        if (orderParams[key] === undefined) {
+            delete orderParams[key];
+        }
+    });
+    
+    const sideText = side === 1 ? 'Открыть лонг' : side === 3 ? 'Открыть шорт' : side === 4 ? 'Закрыть лонг' : 'Закрыть шорт';
+    const typeText = type === 5 ? 'Market' : type === 1 ? 'Limit' : type === 3 ? 'IOC' : type === 4 ? 'FOK' : 'Post Only';
+    
+    // Детальное логирование для диагностики
+    log(`📊 Параметры ордера:`, 'info');
+    log(`   Символ: ${symbol}`, 'info');
+    log(`   Направление: ${sideText}`, 'info');
+    log(`   Тип: ${typeText}`, 'info');
+    log(`   ВВЕДЕННЫЙ объем: ${volumeInput} ${volumeType === 'usdt' ? 'USDT' : symbol.split('_')[0]}`, 'info');
+    log(`   Объем в коинах (vol для API): ${volume.toFixed(8)} ${symbol.split('_')[0]}`, 'info');
+    log(`   Размер позиции: ${volumeInUsdt.toFixed(2)} USDT`, 'info');
+    log(`   Цена: ${price.toFixed(priceScale)} USDT`, 'info');
+    log(`   Маржа: ${requiredMargin.toFixed(2)} USDT`, 'info');
+    log(`   Плечо: ${actualLeverage}x${isClosing && existingPosition ? ' (из существующей позиции)' : isOpeningNew && existingPosition ? ' (новое, существующая: ' + existingPosition.leverage + 'x)' : ''}`, 'info');
+    log(`   Проверка: ${volume.toFixed(8)} * ${price.toFixed(priceScale)} = ${(volume * price).toFixed(2)} USDT (размер позиции)`, 'info');
+    log(`   Проверка маржи: ${(volume * price).toFixed(2)} / ${actualLeverage} = ${((volume * price) / actualLeverage).toFixed(2)} USDT`, 'info');
+    console.log('Order params:', JSON.stringify(orderParams, null, 2));
+    console.log('Volume calculation:', {
+        volumeInput,
+        volumeType,
+        volumeInCoins: volume,
+        volumeInUsdt,
+        calculatedPositionSize: volume * price,
+        requiredMargin,
+        actualLeverage,
+        price
+    });
+    
+    try {
+        const result = await api.submitOrder(orderParams);
+        console.log('Order API response:', result);
+        
+        if (result.success) {
+            // SDK возвращает data напрямую (это может быть число - orderId, или объект)
+            const orderData = result.data;
+            let orderId = null;
+            
+            // Проверяем разные форматы ответа
+            if (typeof orderData === 'number') {
+                orderId = orderData;
+            } else if (orderData && typeof orderData === 'object') {
+                // Если это объект с success: false и code/message - это ошибка
+                if (orderData.success === false) {
+                    const errorMsg = orderData.message || `Code: ${orderData.code}`;
+                    log(`❌ Ошибка создания ордера: ${errorMsg}`, 'error');
+                    return;
+                }
+                
+                // Проверяем разные возможные поля для orderId
+                orderId = orderData.data || orderData.orderId || orderData.id || orderData.order_id;
+                
+                // Если это объект с code и data
+                if (orderData.code !== undefined && orderData.data !== undefined) {
+                    orderId = orderData.data;
+                }
+            }
+            
+            // Проверяем, что orderId действительно получен
+            if (!orderId || orderId === 'null' || orderId === 'undefined') {
+                log(`⚠️ Ордер отправлен, но Order ID не получен. Проверьте позиции и историю ордеров.`, 'warning');
+                console.error('Order response without ID:', result);
+                // Обновляем позиции и баланс
+                await loadPositions();
+                await refreshBalance();
+            } else {
+                log(`✅ Ордер успешно создан! Order ID: ${orderId}`, 'info');
+                // Небольшая задержка перед обновлением, чтобы данные успели обновиться на сервере
+                setTimeout(async () => {
+                    await loadPositions();
+                    await refreshBalance();
+                }, 1000);
+            }
+        } else {
+            const errorMsg = result.error || result.originalError || 'Unknown error';
+            log(`❌ Ошибка создания ордера: ${errorMsg}`, 'error');
+        }
+    } catch (error) {
+        log(`❌ Ошибка: ${error.message}`, 'error');
+        console.error('Order submission error:', error);
+    }
+}
+
+async function cancelAllOrders() {
+    if (!authTokenSet) {
+        log('❌ Сначала установите токен авторизации', 'error');
+        return;
+    }
+
+    const symbol = getSelectedSymbol();
+    
+    log(`⚠️ Отмена всех ордеров${symbol ? ` для ${symbol}` : ''}...`, 'warning');
+    
+    try {
+        const result = await api.cancelAllOrders(symbol || undefined);
+        if (result.success) {
+            log('✅ Все ордера отменены', 'info');
+            loadOrderHistory();
+        } else {
+            log(`❌ Ошибка отмены ордеров: ${result.error}`, 'error');
+        }
+    } catch (error) {
+        log(`❌ Ошибка: ${error.message}`, 'error');
+    }
+}
+
+// Информация о балансе
+async function refreshBalance() {
+    if (!authTokenSet) {
+        log('❌ Сначала установите токен авторизации', 'error');
+        return;
+    }
+
+    try {
+        const result = await api.getAccountAsset('USDT');
+        if (result.success && result.data) {
+            let asset = result.data;
+            // Проверяем вложенную структуру
+            if (asset.data && typeof asset.data === 'object') {
+                asset = asset.data;
+            }
+            displayBalance(asset);
+        } else {
+            log(`❌ Ошибка загрузки баланса: ${result.error}`, 'error');
+        }
+    } catch (error) {
+        log(`❌ Ошибка: ${error.message}`, 'error');
+    }
+}
+
+function displayBalance(asset) {
+    const div = document.getElementById('balanceInfo');
+    if (!div) return;
+    
+    div.innerHTML = `
+        <div class="market-data-item">
+            <strong>Валюта:</strong>
+            <span>${asset.currency || 'USDT'}</span>
+        </div>
+        <div class="market-data-item">
+            <strong>Доступно:</strong>
+            <span class="price-positive">${parseFloat(asset.availableBalance || 0).toLocaleString('ru-RU', {minimumFractionDigits: 2, maximumFractionDigits: 8})}</span>
+        </div>
+        <div class="market-data-item">
+            <strong>Заморожено:</strong>
+            <span>${parseFloat(asset.frozenBalance || 0).toLocaleString('ru-RU', {minimumFractionDigits: 2, maximumFractionDigits: 8})}</span>
+        </div>
+        <div class="market-data-item">
+            <strong>Маржа позиций:</strong>
+            <span>${parseFloat(asset.positionMargin || 0).toLocaleString('ru-RU', {minimumFractionDigits: 2, maximumFractionDigits: 8})}</span>
+        </div>
+        <div class="market-data-item">
+            <strong>Собственный капитал:</strong>
+            <span class="price-positive">${parseFloat(asset.equity || 0).toLocaleString('ru-RU', {minimumFractionDigits: 2, maximumFractionDigits: 8})}</span>
+        </div>
+    `;
+}
+
+// Позиции
+async function loadPositions() {
+    if (!authTokenSet) {
+        log('❌ Сначала установите токен авторизации', 'error');
+        return;
+    }
+
+    try {
+        const result = await api.getOpenPositions();
+        if (result.success && result.data) {
+            let positions = result.data;
+            // Проверяем вложенную структуру
+            if (positions.data && Array.isArray(positions.data)) {
+                positions = positions.data;
+            } else if (Array.isArray(positions)) {
+                // Уже массив
+            } else {
+                positions = [];
+            }
+            
+            // Отладочное логирование (можно включить при необходимости)
+            // if (positions.length > 0 && window.DEBUG) {
+            //     console.log('Position data sample:', positions[0]);
+            // }
+            
+            displayPositions(positions);
+        } else {
+            log(`❌ Ошибка загрузки позиций: ${result.error}`, 'error');
+        }
+    } catch (error) {
+        log(`❌ Ошибка: ${error.message}`, 'error');
+    }
+}
+
+// Алиас для совместимости
+function refreshPositions() {
+    return loadPositions();
+}
+
+function displayPositions(positions) {
+    const div = document.getElementById('positionsInfo');
+    if (!div) return;
+    
+    if (positions.length === 0) {
+        div.innerHTML = '<p>Нет открытых позиций</p>';
+        return;
+    }
+
+    let html = '<table><thead><tr><th>Символ</th><th>Тип</th><th>Объем</th><th>Цена</th><th>PnL</th></tr></thead><tbody>';
+    
+    positions.forEach(pos => {
+        const type = pos.positionType === 1 ? 'LONG' : 'SHORT';
+        const typeClass = pos.positionType === 1 ? 'position-long' : 'position-short';
+        
+        // Пробуем разные варианты полей для PnL
+        let pnl = parseFloat(
+            pos.unrealisedPnl || 
+            pos.unrealised || 
+            pos.unrealisedProfit ||
+            pos.floatingPnL ||
+            pos.profit || 
+            pos.profitLoss || 
+            pos.realised || 
+            pos.pnl ||
+            pos.unrealizedPnl ||
+            pos.unrealized ||
+            0
+        );
+        
+        // Если PnL все еще 0, пытаемся рассчитать вручную на основе текущей цены
+        if (pnl === 0 && pos.holdVol && pos.holdAvgPrice) {
+            const posSymbol = pos.symbol;
+            // Используем сохраненную цену для этого символа или текущую цену
+            const posCurrentPrice = symbolPrices[posSymbol] || (posSymbol === currentSymbol ? currentPrice : 0);
+            
+            // Если нет сохраненной цены, пытаемся загрузить тикер для этого символа
+            if (posCurrentPrice <= 0 && posSymbol !== currentSymbol) {
+                // Асинхронно загружаем цену для этого символа (не блокируем отображение)
+                api.getTicker(posSymbol).then(tickerResult => {
+                    if (tickerResult.success && tickerResult.data) {
+                        const price = parseFloat(tickerResult.data.lastPrice || 0);
+                        if (price > 0) {
+                            symbolPrices[posSymbol] = price;
+                            // Также загружаем contractSize для этого символа
+                            loadContractDetail(posSymbol);
+                            // Перерисовываем позиции после получения цены
+                            loadPositions();
+                        }
+                    }
+                }).catch(() => {});
+            }
+            
+            // Если нет contractSize, загружаем его
+            if (!symbolContractSizes[posSymbol]) {
+                loadContractDetail(posSymbol);
+            }
+            
+            if (posCurrentPrice > 0) {
+                const holdVol = parseFloat(pos.holdVol || 0);
+                const holdAvgPrice = parseFloat(pos.holdAvgPrice || 0);
+                // Получаем contractSize для этого символа (по умолчанию 1)
+                const contractSize = symbolContractSizes[posSymbol] || 1;
+                
+                if (pos.positionType === 1) {
+                    // LONG: PnL в USDT = (текущая_цена - цена_входа) * объем_в_контрактах * contractSize
+                    // holdVol уже в контрактах, поэтому умножаем на contractSize для получения USDT
+                    pnl = (posCurrentPrice - holdAvgPrice) * holdVol * contractSize;
+                } else {
+                    // SHORT: PnL в USDT = (цена_входа - текущая_цена) * объем_в_контрактах * contractSize
+                    pnl = (holdAvgPrice - posCurrentPrice) * holdVol * contractSize;
+                }
+            }
+        }
+        
+        const pnlClass = pnl >= 0 ? 'price-positive' : 'price-negative';
+        
+        html += `
+            <tr>
+                <td>${pos.symbol}</td>
+                <td class="${typeClass}">${type}</td>
+                <td>${parseFloat(pos.holdVol || 0).toLocaleString('ru-RU', {minimumFractionDigits: 4, maximumFractionDigits: 8})}</td>
+                <td>$${parseFloat(pos.holdAvgPrice || 0).toLocaleString('ru-RU', {minimumFractionDigits: 2, maximumFractionDigits: 8})}</td>
+                <td class="${pnlClass}">${pnl >= 0 ? '+' : ''}$${pnl.toLocaleString('ru-RU', {minimumFractionDigits: 2, maximumFractionDigits: 2})}</td>
+            </tr>
+        `;
+    });
+    
+    html += '</tbody></table>';
+    div.innerHTML = html;
+}
+
+// История ордеров
+async function loadOrderHistory() {
+    if (!authTokenSet) {
+        log('❌ Сначала установите токен авторизации', 'error');
+        return;
+    }
+
+    const symbol = getSelectedSymbol();
+    
+    try {
+        const result = await api.getOrderHistory({
+            category: 1,
+            page_num: 1,
+            page_size: 20,
+            states: 3, // Выполненные
+            symbol: symbol
+        });
+        
+        if (result.success && result.data) {
+            let orders = result.data;
+            // Проверяем вложенную структуру
+            if (orders.data && orders.data.orders && Array.isArray(orders.data.orders)) {
+                orders = orders.data.orders;
+            } else if (orders.orders && Array.isArray(orders.orders)) {
+                orders = orders.orders;
+            } else if (Array.isArray(orders)) {
+                // Уже массив
+            } else {
+                orders = [];
+            }
+            displayOrderHistory(orders);
+        } else {
+            log(`❌ Ошибка загрузки истории: ${result.error}`, 'error');
+        }
+    } catch (error) {
+        log(`❌ Ошибка: ${error.message}`, 'error');
+    }
+}
+
+function displayOrderHistory(orders) {
+    const div = document.getElementById('orderHistoryInfo');
+    if (!div) return;
+    
+    if (orders.length === 0) {
+        div.innerHTML = '<p>Нет ордеров в истории</p>';
+        return;
+    }
+
+    let html = '<table><thead><tr><th>ID</th><th>Символ</th><th>Направление</th><th>Тип</th><th>Цена</th><th>Объем</th><th>Комиссия</th><th>Статус</th></tr></thead><tbody>';
+    
+    orders.forEach(order => {
+        const sideMap = { 1: 'Open Long', 2: 'Close Short', 3: 'Open Short', 4: 'Close Long' };
+        const typeMap = { 1: 'Limit', 2: 'Post Only', 3: 'IOC', 4: 'FOK', 5: 'Market', 6: 'Convert' };
+        const side = sideMap[order.side] || order.side;
+        const type = typeMap[order.type] || order.type;
+        // Комиссия может быть в разных полях: fee, commission, dealFee, dealFeeValue
+        const fee = parseFloat(order.fee || order.commission || order.dealFee || order.dealFeeValue || 0);
+        const feeDisplay = fee > 0 ? fee.toLocaleString('ru-RU', {minimumFractionDigits: 4, maximumFractionDigits: 8}) : '-';
+        
+        html += `
+            <tr>
+                <td>${order.id}</td>
+                <td>${order.symbol}</td>
+                <td>${side}</td>
+                <td>${type}</td>
+                <td>$${parseFloat(order.price || 0).toLocaleString('ru-RU', {minimumFractionDigits: 2, maximumFractionDigits: 8})}</td>
+                <td>${parseFloat(order.vol || 0).toLocaleString('ru-RU', {minimumFractionDigits: 4, maximumFractionDigits: 8})}</td>
+                <td>${feeDisplay}</td>
+                <td>${order.status}</td>
+            </tr>
+        `;
+    });
+    
+    html += '</tbody></table>';
+    div.innerHTML = html;
+}
+// ==================== API KEY FUNCTIONS ====================
+
+async function setApiKeys() {
+    const apiKey = document.getElementById('apiKey').value.trim();
+    const apiSecret = document.getElementById('apiSecret').value.trim();
+    
+    if (!apiKey || !apiSecret) {
+        log('❌ Пожалуйста, введите API Key и Secret', 'error');
+        return;
+    }
+    
+    log('Установка API ключей...', 'info');
+    
+    try {
+        const result = await api.setApiKeys(apiKey, apiSecret);
+        if (result.success) {
+            log('✅ API ключи успешно сохранены', 'info');
+            loadTradeHistory();
+        } else {
+            log(`❌ Ошибка установки API ключей: ${result.error}`, 'error');
+        }
+    } catch (error) {
+        log(`❌ Ошибка: ${error.message}`, 'error');
+    }
+}
+
+async function testApiKeys() {
+    log('Проверка API ключей...', 'info');
+    try {
+        const result = await api.testApiKeys();
+        if (result.success) {
+            log('✅ API ключи работают корректно', 'info');
+        } else {
+            log(`❌ API ключи не работают: ${result.error || 'Неверные ключи или нет доступа'}`, 'error');
+        }
+    } catch (error) {
+        log(`❌ Ошибка проверки: ${error.message}`, 'error');
+    }
+}
+
+// Загрузка истории сделок через API ключи
+// Загружаем contractSize для символов из истории сделок
+async function loadContractSizesForHistory(orders) {
+    if (!orders || !Array.isArray(orders)) return;
+    
+    const symbols = [...new Set(orders.map(o => o.symbol).filter(Boolean))];
+    for (const symbol of symbols) {
+        // Если contractSize еще не загружен для этого символа
+        if (!symbolContractSizes[symbol]) {
+            try {
+                const contractResult = await api.getContractDetail(symbol);
+                if (contractResult.success && contractResult.data) {
+                    let contractData = contractResult.data;
+                    if (contractData.data && typeof contractData.data === 'object') {
+                        contractData = contractData.data;
+                    }
+                    
+                    let contract = null;
+                    if (Array.isArray(contractData)) {
+                        contract = contractData.find(c => c.symbol === symbol);
+                    } else if (contractData.symbol === symbol || !contractData.symbol) {
+                        contract = contractData;
+                    }
+                    
+                    if (contract && contract.contractSize !== undefined && contract.contractSize !== null) {
+                        symbolContractSizes[symbol] = parseFloat(contract.contractSize) || 1;
+                        console.log(`[UI] Loaded contractSize for ${symbol}:`, symbolContractSizes[symbol]);
+                    }
+                }
+            } catch (error) {
+                console.debug(`[UI] Failed to load contractSize for ${symbol}:`, error);
+            }
+        }
+    }
+}
+
+async function loadTradeHistory() {
+    const symbol = getSelectedSymbol();
+    
+    try {
+        log('Загрузка истории сделок через API ключи...', 'info');
+        const result = await api.getTradeHistory(symbol, 20);
+        
+        console.log('[UI] Trade history result:', result);
+        
+        if (result.success && result.data) {
+            let orders = result.data;
+            
+            // Логируем структуру для отладки
+            console.log('[UI] Raw orders data:', orders);
+            console.log('[UI] Orders type:', typeof orders);
+            console.log('[UI] Is array:', Array.isArray(orders));
+            
+            // Проверяем вложенную структуру (MEXC может возвращать данные в разных форматах)
+            if (orders && typeof orders === 'object') {
+                // Вариант 1: { success: true, data: { data: { orders: [...] } } }
+                if (orders.data && orders.data.orders && Array.isArray(orders.data.orders)) {
+                    orders = orders.data.orders;
+                    console.log('[UI] Found orders in data.data.orders');
+                }
+                // Вариант 2: { success: true, data: { orders: [...] } }
+                else if (orders.orders && Array.isArray(orders.orders)) {
+                    orders = orders.orders;
+                    console.log('[UI] Found orders in data.orders');
+                }
+                // Вариант 3: { success: true, data: [...] } - уже массив
+                else if (Array.isArray(orders)) {
+                    console.log('[UI] Data is already an array');
+                }
+                // Вариант 4: { success: true, data: { data: [...] } }
+                else if (orders.data && Array.isArray(orders.data)) {
+                    orders = orders.data;
+                    console.log('[UI] Found orders in data.data');
+                }
+                else {
+                    console.log('[UI] Unknown structure, setting empty array');
+                    orders = [];
+                }
+            } else if (Array.isArray(orders)) {
+                console.log('[UI] Orders is already an array');
+            } else {
+                console.log('[UI] Orders is not an array or object, setting empty array');
+                orders = [];
+            }
+            
+            console.log('[UI] Final orders count:', orders.length);
+            
+            // Загружаем contractSize для всех символов из истории (если еще не загружены)
+            await loadContractSizesForHistory(orders);
+            
+            displayTradeHistory(orders);
+            
+            // Проверяем последнюю сделку на комиссию после отображения
+            await checkLastTradeForCommission(orders);
+        } else {
+            const errorMsg = result.error || result.message || 'Не удалось загрузить историю сделок';
+            console.error('[UI] Error loading history:', errorMsg, result);
+            log(`❌ Ошибка загрузки истории: ${errorMsg}`, 'error');
+            const div = document.getElementById('tradeHistoryInfo');
+            if (div) {
+                div.innerHTML = `<p style="color: #ef4444;">${errorMsg}</p>`;
+            }
+        }
+    } catch (error) {
+        log(`❌ Ошибка: ${error.message}`, 'error');
+        const div = document.getElementById('tradeHistoryInfo');
+        if (div) {
+            div.innerHTML = `<p style="color: #ef4444;">Ошибка: ${error.message}</p>`;
+        }
+    }
+}
+
+function displayTradeHistory(orders) {
+    const div = document.getElementById('tradeHistoryInfo');
+    if (!div) return;
+    
+    if (orders.length === 0) {
+        div.innerHTML = '<p>Нет сделок в истории</p>';
+        return;
+    }
+
+    let html = '<table><thead><tr><th>ID</th><th>Символ</th><th>Направление</th><th>Цена</th><th>Объем ($)</th><th>Комиссия (USDT)</th><th>Статус</th></tr></thead><tbody>';
+    
+    orders.forEach(order => {
+        const sideMap = { 1: 'Open Long', 2: 'Close Short', 3: 'Open Short', 4: 'Close Long' };
+        const typeMap = { 1: 'Limit', 2: 'Post Only', 3: 'IOC', 4: 'FOK', 5: 'Market', 6: 'Convert' };
+        const side = sideMap[order.side] || order.side;
+        const type = typeMap[order.type] || order.type;
+        
+        // Сокращаем ID (показываем только последние 6 символов)
+        const orderId = order.orderId || order.id || 'N/A';
+        const shortId = typeof orderId === 'string' && orderId.length > 6 
+            ? '...' + orderId.slice(-6) 
+            : orderId;
+        
+        // Объем в долларах
+        // ВАЖНО: vol в истории ордеров MEXC - это объем в КОНТРАКТАХ, не в коинах!
+        // Размер позиции = vol * price * contractSize
+        // Для большинства USDT контрактов contractSize = 1, но для некоторых (например, UNI_USDT) может быть другим
+        const price = parseFloat(order.price || order.dealPrice || order.dealAvgPrice || 0);
+        const vol = parseFloat(order.vol || order.dealVol || order.volume || 0);
+        const dealAmount = parseFloat(order.dealAmount || order.amount || 0);
+        const symbol = order.symbol || '';
+        
+        // Получаем contractSize для этого символа (если есть в кэше)
+        let contractSize = 1; // По умолчанию 1
+        if (symbol && symbolContractSizes[symbol]) {
+            contractSize = symbolContractSizes[symbol];
+        }
+        
+        let volumeInUsdt = 0;
+        if (dealAmount > 0) {
+            // Если есть dealAmount - используем его (уже в USDT)
+            volumeInUsdt = dealAmount;
+        } else if (vol > 0 && price > 0) {
+            // Правильный расчет: vol * price * contractSize
+            // vol - это объем в контрактах
+            // price - цена
+            // contractSize - размер контракта (для большинства USDT контрактов = 1, но может быть другим, например 0.1 для UNI_USDT)
+            volumeInUsdt = vol * price * contractSize;
+            
+            // Логируем для отладки
+            console.log('[UI] Order volume calculation:', {
+                orderId: order.orderId || order.id,
+                symbol,
+                vol,
+                price,
+                contractSize,
+                dealAmount,
+                calculated: volumeInUsdt,
+                formula: `${vol} * ${price} * ${contractSize} = ${volumeInUsdt}`
+            });
+        }
+        
+        // Комиссия может быть в разных полях
+        // MEXC возвращает: totalFee, makerFee, takerFee, fee, commission, dealFee, dealFeeValue
+        // Приоритет: totalFee > (makerFee + takerFee) > fee > commission > dealFee > dealFeeValue
+        let fee = 0;
+        if (order.totalFee !== undefined && order.totalFee !== null) {
+            fee = parseFloat(order.totalFee) || 0;
+        } else if ((order.makerFee !== undefined || order.takerFee !== undefined)) {
+            const makerFee = parseFloat(order.makerFee || 0);
+            const takerFee = parseFloat(order.takerFee || 0);
+            fee = makerFee + takerFee;
+        } else {
+            fee = parseFloat(order.fee || order.commission || order.dealFee || order.dealFeeValue || 0);
+        }
+        
+        const feeDisplay = fee > 0 
+            ? `<span style="color: #ef4444;">$${fee.toFixed(4)}</span>` 
+            : '<span style="color: #22c55e;">$0.0000</span>';
+        
+        // Логируем для отладки, если комиссия не найдена
+        if (fee === 0) {
+            console.log('[UI] Fee not found in order:', {
+                orderId: order.orderId || order.id,
+                totalFee: order.totalFee,
+                makerFee: order.makerFee,
+                takerFee: order.takerFee,
+                fee: order.fee,
+                commission: order.commission,
+                dealFee: order.dealFee,
+                dealFeeValue: order.dealFeeValue,
+                fullOrder: order
+            });
+        }
+        
+        html += `
+            <tr>
+                <td>${shortId}</td>
+                <td>${order.symbol || '-'}</td>
+                <td>${side}</td>
+                <td>$${price.toFixed(3)}</td>
+                <td>$${volumeInUsdt.toFixed(2)}</td>
+                <td>${feeDisplay}</td>
+                <td>${order.status || 'Выполнен'}</td>
+            </tr>
+        `;
+    });
+    
+    html += '</tbody></table>';
+    div.innerHTML = html;
+}
+
+// Проверка последней сделки на комиссию и остановка бота при необходимости
+async function checkLastTradeForCommission(orders) {
+    if (!orders || orders.length === 0) {
+        return;
+    }
+    
+    // Берем последнюю сделку (первая в массиве, так как обычно сортировка по убыванию времени)
+    const lastOrder = orders[0];
+    
+    // Проверяем комиссию в последней сделке
+    let fee = 0;
+    if (lastOrder.totalFee !== undefined && lastOrder.totalFee !== null) {
+        fee = parseFloat(lastOrder.totalFee) || 0;
+    } else if ((lastOrder.makerFee !== undefined || lastOrder.takerFee !== undefined)) {
+        const makerFee = parseFloat(lastOrder.makerFee || 0);
+        const takerFee = parseFloat(lastOrder.takerFee || 0);
+        fee = makerFee + takerFee;
+    } else {
+        fee = parseFloat(lastOrder.fee || lastOrder.commission || lastOrder.dealFee || lastOrder.dealFeeValue || 0);
+    }
+    
+    // Если комиссия больше 0 - останавливаем бота
+    if (fee > 0) {
+        console.log(`[UI] 🚨 Обнаружена комиссия в последней сделке: $${fee.toFixed(4)}, останавливаем бота`);
+        log(`🚨 Обнаружена комиссия в последней сделке: $${fee.toFixed(4)}. Останавливаем бота...`, 'warning');
+        
+        try {
+            const result = await api.request('/api/bot/stop-after-close', {
+                method: 'POST'
+            });
+            
+            if (result.success) {
+                if (result.hasPosition) {
+                    log(`⚠️ Позиция открыта. Бот будет остановлен после закрытия позиции.`, 'warning');
+                } else {
+                    log(`🛑 Бот остановлен немедленно (позиции нет).`, 'success');
+                    // Обновляем статус
+                    if (typeof updateArbitrageStatus === 'function') {
+                        updateArbitrageStatus();
+                    }
+                    // Устанавливаем флаг, что бот остановлен
+                    window.arbitrageBotRunning = false;
+                }
+            } else {
+                log(`❌ Ошибка остановки бота: ${result.error}`, 'error');
+            }
+        } catch (error) {
+            console.error('[UI] Ошибка остановки бота при обнаружении комиссии:', error);
+            log(`❌ Ошибка остановки бота: ${error.message}`, 'error');
+        }
+    }
+}
+
+// Автоматическое обновление истории сделок после закрытия позиции
+// История обновляется автоматически только после закрытия позиции (вручную или ботом)
+// Не обновляется постоянно - только по событию закрытия
+let tradeHistoryInterval = null;
+function startTradeHistoryAutoUpdate() {
+    // Убрали периодическую проверку - обновление происходит только после закрытия позиции
+    // Это более эффективно и не нагружает сервер
+    if (tradeHistoryInterval) {
+        clearInterval(tradeHistoryInterval);
+        tradeHistoryInterval = null;
+    }
+}
+
+function stopTradeHistoryAutoUpdate() {
+    if (tradeHistoryInterval) {
+        clearInterval(tradeHistoryInterval);
+        tradeHistoryInterval = null;
+    }
+}
+
+// Перезагрузка сервера
+async function restartServer() {
+    if (!confirm('Вы уверены, что хотите перезагрузить сервер? Все подключения будут перезапущены.')) {
+        return;
+    }
+    
+    try {
+        log('Перезагрузка сервера...', 'info');
+        const result = await api.restartServer();
+        if (result.success) {
+            log('✓ Сервер перезагружен. Все компоненты перезапущены.', 'success');
+            // Обновляем статус через 2 секунды
+            setTimeout(() => {
+                if (typeof updateArbitrageStatus === 'function') {
+                    updateArbitrageStatus();
+                }
+                if (typeof updateSpread === 'function') {
+                    updateSpread();
+                }
+            }, 2000);
+        } else {
+            log(`Ошибка перезагрузки сервера: ${result.error}`, 'error');
+        }
+    } catch (error) {
+        log(`Ошибка перезагрузки сервера: ${error.message}`, 'error');
+    }
+}
+
+// Запускаем автообновление истории при загрузке страницы
+window.addEventListener('load', () => {
+    startTradeHistoryAutoUpdate();
+});
+
