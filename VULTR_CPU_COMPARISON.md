@@ -205,3 +205,4 @@ Optimized Cloud Compute нужен только если:
 - [Optimized Cloud Compute](https://www.vultr.com/docs/optimized-cloud-compute/)
 
 
+

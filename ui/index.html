@@ -57,8 +57,68 @@
                             Максимальное отклонение цены исполнения от ожидаемой. Защита от больших потерь при недостаточной ликвидности.
                         </div>
                     </div>
+                    
+                    <div style="margin-top: 16px; padding-top: 16px; border-top: 1px solid #334155;">
+                        <div class="form-group">
+                            <label for="autoLeverage">Авто плечо:</label>
+                            <input type="number" id="autoLeverage" value="10" min="1" max="125" />
+                            <div style="font-size: 11px; color: #94a3b8; margin-top: 4px;">
+                                Плечо, которое будет использоваться при запуске торгового бота.
+                            </div>
+                        </div>
+                    </div>
+                    
+                    <div style="margin-top: 16px; padding-top: 16px; border-top: 1px solid #334155;">
+                        <div class="form-group">
+                            <label style="display: flex; align-items: center; gap: 8px; cursor: pointer;">
+                                <input type="checkbox" id="autoVolumeEnabled" onchange="toggleAutoVolume()" />
+                                <span><strong>Автообъем</strong></span>
+                            </label>
+                            <div style="font-size: 11px; color: #94a3b8; margin-top: 4px; margin-left: 24px;">
+                                Автоматически регулирует объем в зависимости от баланса счета. Обновляется каждые 3 сделки.
+                            </div>
+                        </div>
+                        
+                        <div id="autoVolumeSettings" style="display: none; margin-top: 12px; padding: 12px; background: #1e293b; border: 1px solid #334155; border-radius: 4px;">
+                            <div class="form-group">
+                                <label for="autoVolumePercent">Процент от баланса (%):</label>
+                                <input type="number" id="autoVolumePercent" value="90" min="1" max="100" step="1" />
+                                <div style="font-size: 11px; color: #94a3b8; margin-top: 4px;">
+                                    Процент от максимально возможного объема (с учетом плеча), который будет использоваться для торговли.
+                                </div>
+                            </div>
+                            <div class="form-group">
+                                <label for="autoVolumeMax">Максимальный объем (USDT):</label>
+                                <input type="number" id="autoVolumeMax" value="3500" min="1" step="1" />
+                                <div style="font-size: 11px; color: #94a3b8; margin-top: 4px;">
+                                    Максимальная сумма для торговли при включенном Автообъеме. Если расчетный объем превысит это значение, будет использоваться максимальный.
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                    
+                    <div style="margin-top: 16px; padding-top: 16px; border-top: 1px solid #334155;">
+                        <div class="form-group">
+                            <label for="marginMode">Маржа:</label>
+                            <select id="marginMode" style="width: 100%; padding: 6px; background: #1e293b; border: 1px solid #334155; border-radius: 4px; color: #e2e8f0;">
+                                <option value="isolated">Изолированная (Isolated)</option>
+                                <option value="cross">Кросс (Cross)</option>
+                            </select>
+                            <div style="font-size: 11px; color: #94a3b8; margin-top: 4px;">
+                                Режим маржи для открытия позиций. <strong>Изолированная:</strong> маржа изолирована для каждой позиции. <strong>Кросс:</strong> общая маржа для всех позиций.
+                            </div>
+                        </div>
+                        <div class="form-group">
+                            <label for="minBalanceForTrading">Минимальная сумма для торговли (USDT):</label>
+                            <input type="number" id="minBalanceForTrading" value="0.5" min="0" step="0.01" />
+                            <div style="font-size: 11px; color: #94a3b8; margin-top: 4px;">
+                                Минимальный баланс на аккаунте для продолжения торговли. Если баланс опустится ниже этого значения, бот переключится на следующий аккаунт (в режиме мультиаккаунтинга) или остановится.
+                            </div>
+                        </div>
+                    </div>
+                    
                     <div style="font-size: 11px; color: #60a5fa; margin-top: 8px; padding: 6px; background: #1e293b; border: 1px solid #334155; border-radius: 4px;">
-                        <strong>💡 Объем позиции</strong> настраивается в панели <strong>"Параметры ордера"</strong> (поле "Объем" в USDT). Этот объем будет использоваться для автоматического арбитража.
+                        <strong>💡 Примечание:</strong> Если Автообъем выключен, объем позиции настраивается в панели <strong>"Параметры ордера"</strong> (поле "Объем" в USDT).
                     </div>
                     <button class="btn-primary" onclick="saveArbitrageSettings()">💾 Сохранить</button>
                 </section>
@@ -77,6 +137,28 @@
                 <!-- Настройки подключения -->
                 <section class="card">
                     <h2>🔐 Подключение</h2>
+                    
+                    <!-- Переключатель режима аккаунта -->
+                    <div class="form-group" style="margin-bottom: 16px; padding: 12px; background: #1e293b; border: 1px solid #334155; border-radius: 4px;">
+                        <label style="font-weight: bold; margin-bottom: 8px; display: block;">Режим работы:</label>
+                        <div style="display: flex; gap: 12px;">
+                            <label style="display: flex; align-items: center; gap: 6px; cursor: pointer; flex: 1;">
+                                <input type="radio" name="accountMode" value="single" id="accountModeSingle" checked />
+                                <span>Один аккаунт</span>
+                            </label>
+                            <label style="display: flex; align-items: center; gap: 6px; cursor: pointer; flex: 1;">
+                                <input type="radio" name="accountMode" value="multi" id="accountModeMulti" />
+                                <span>Мультиаккаунтинг</span>
+                            </label>
+                        </div>
+                        <div style="font-size: 11px; color: #94a3b8; margin-top: 8px;">
+                            <strong>Один аккаунт:</strong> Торговля на одном аккаунте (текущий режим)<br>
+                            <strong>Мультиаккаунтинг:</strong> Автоматическое переключение между несколькими аккаунтами
+                        </div>
+                    </div>
+                    
+                    <!-- Обычный режим (один аккаунт) -->
+                    <div id="singleAccountMode">
                     <div class="form-group" style="display: flex; gap: 4px; align-items: flex-end;">
                         <div style="flex: 1;">
                             <label for="authToken">WEB Token:</label>
@@ -103,6 +185,54 @@
                             <button class="btn-primary" onclick="setApiKeys()" style="flex: 1; padding: 6px;">Сохранить</button>
                             <button class="btn-secondary" onclick="testApiKeys()" style="flex: 1; padding: 6px;">Проверить</button>
                         </div>
+                    </div>
+                    </div>
+                </section>
+
+                <!-- Мультиаккаунтинг -->
+                <section class="card" id="multiAccountSection" style="display: none;">
+                    <h2>👥 Мультиаккаунтинг</h2>
+                    
+                    <!-- Настройки мультиаккаунтинга -->
+                    <div style="margin-bottom: 20px; padding: 12px; background: #1e293b; border: 1px solid #334155; border-radius: 4px;">
+                        <h3 style="margin-top: 0; font-size: 14px; color: #60a5fa;">⚙️ Настройки переключения</h3>
+                        <div class="form-group">
+                            <label for="multiAccountTargetBalance">Финальный баланс (USDT):</label>
+                            <input type="number" id="multiAccountTargetBalance" value="0" min="0" step="0.01" />
+                            <div style="font-size: 11px; color: #94a3b8; margin-top: 4px;">
+                                Если баланс на текущем аккаунте достигнет этой суммы, бот переключится на следующий аккаунт.
+                            </div>
+                        </div>
+                        <div class="form-group">
+                            <label for="multiAccountMaxTime">Время торговли (минуты):</label>
+                            <input type="number" id="multiAccountMaxTime" value="0" min="0" step="1" />
+                            <div style="font-size: 11px; color: #94a3b8; margin-top: 4px;">
+                                Максимальное время торговли на одном аккаунте. После истечения времени бот переключится на следующий аккаунт.
+                            </div>
+                        </div>
+                        <button class="btn-primary" onclick="saveMultiAccountConfig()" style="width: 100%;">💾 Сохранить настройки</button>
+                    </div>
+                    
+                    <!-- Список аккаунтов -->
+                    <div style="margin-bottom: 20px;">
+                        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px;">
+                            <h3 style="margin: 0; font-size: 14px; color: #60a5fa;">📋 Аккаунты</h3>
+                            <button class="btn-success" onclick="addMultiAccount()" style="padding: 4px 12px; font-size: 12px;">➕ Добавить аккаунт</button>
+                        </div>
+                        <div id="multiAccountList" style="display: flex; flex-direction: column; gap: 12px;">
+                            <div style="padding: 12px; background: #1e293b; border: 1px solid #334155; border-radius: 4px; text-align: center; color: #94a3b8; font-size: 12px;">
+                                Нет аккаунтов. Нажмите "Добавить аккаунт" для начала.
+                            </div>
+                        </div>
+                    </div>
+                    
+                    <!-- Статус и логи -->
+                    <div style="margin-top: 20px; padding-top: 20px; border-top: 1px solid #334155;">
+                        <h3 style="margin-top: 0; font-size: 14px; color: #60a5fa;">📊 Статус</h3>
+                        <div id="multiAccountStatus" style="padding: 12px; background: #1e293b; border: 1px solid #334155; border-radius: 4px; font-size: 12px; color: #94a3b8;">
+                            Загрузка статуса...
+                        </div>
+                        <button class="btn-secondary" onclick="loadMultiAccountStatus()" style="width: 100%; margin-top: 8px; padding: 6px;">🔄 Обновить статус</button>
                     </div>
                 </section>
 

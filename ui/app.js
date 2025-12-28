@@ -200,6 +200,47 @@ const api = {
 document.addEventListener('DOMContentLoaded', () => {
     checkServerConnection();
     
+    // Загружаем конфигурацию мультиаккаунтинга при загрузке страницы
+    loadMultiAccountConfig();
+    
+    // Привязываем обработчики событий для переключателя режима
+    // Используем делегирование событий на родительском элементе для надежности
+    const accountModeContainer = document.querySelector('[name="accountMode"]')?.closest('.form-group');
+    if (accountModeContainer) {
+        accountModeContainer.addEventListener('change', (e) => {
+            if (e.target.type === 'radio' && e.target.name === 'accountMode') {
+                console.log('[MULTI-ACCOUNT] Переключатель изменен:', e.target.value);
+                if (e.target.value === 'single') {
+                    switchAccountMode('single');
+                } else if (e.target.value === 'multi') {
+                    switchAccountMode('multi');
+                }
+            }
+        });
+    }
+    
+    // Также привязываем напрямую для надежности
+    const accountModeSingle = document.getElementById('accountModeSingle');
+    const accountModeMulti = document.getElementById('accountModeMulti');
+    
+    if (accountModeSingle) {
+        accountModeSingle.addEventListener('change', (e) => {
+            console.log('[MULTI-ACCOUNT] Single radio changed:', e.target.checked);
+            if (e.target.checked) {
+                switchAccountMode('single');
+            }
+        });
+    }
+    
+    if (accountModeMulti) {
+        accountModeMulti.addEventListener('change', (e) => {
+            console.log('[MULTI-ACCOUNT] Multi radio changed:', e.target.checked);
+            if (e.target.checked) {
+                switchAccountMode('multi');
+            }
+        });
+    }
+    
     // Автоматическое обновление рыночных данных каждые 5 секунд
     // НЕ обновляем, если арбитражный бот остановлен (чтобы не нагружать сервер)
     marketDataInterval = setInterval(() => {
@@ -229,6 +270,12 @@ function stopAllAutoUpdates() {
     if (typeof stopArbitrageAutoUpdate === 'function') {
         stopArbitrageAutoUpdate();
     }
+    
+    // Останавливаем обновление списка аккаунтов мультиаккаунтинга
+    if (window.multiAccountUpdateInterval) {
+        clearInterval(window.multiAccountUpdateInterval);
+        window.multiAccountUpdateInterval = null;
+    }
 }
 
 // Запуск всех автоматических обновлений
@@ -238,6 +285,28 @@ function startAllAutoUpdates() {
     
     // Интервалы уже запущены при загрузке страницы, просто включаем их работу
     // Они будут работать только если arbitrageBotRunning = true
+    
+    // Обновляем список аккаунтов мультиаккаунтинга каждые 5 секунд (если включен)
+    if (window.multiAccountUpdateInterval) {
+        clearInterval(window.multiAccountUpdateInterval);
+    }
+    window.multiAccountUpdateInterval = setInterval(async () => {
+        try {
+            // Проверяем, не открыта ли форма добавления аккаунта
+            const listContainer = document.getElementById('multiAccountList');
+            if (listContainer && listContainer.querySelector('.new-account-form')) {
+                // Если форма открыта, пропускаем обновление
+                return;
+            }
+            
+            const configResult = await api.request('/api/multi-account/config');
+            if (configResult.success && configResult.data.enabled) {
+                await loadMultiAccountAccounts(); // Обновляем список аккаунтов с актуальными балансами
+            }
+        } catch (error) {
+            // Игнорируем ошибки
+        }
+    }, 5000); // Обновляем каждые 5 секунд
 }
 
 // Проверка подключения к серверу
@@ -1708,7 +1777,10 @@ async function loadTradeHistory() {
     
     try {
         log('Загрузка истории сделок через API ключи...', 'info');
-        const result = await api.getTradeHistory(symbol, 20);
+        // ОПТИМИЗАЦИЯ: Загружаем только 4 последних сделки вместо 20
+        // Для проверки комиссии нужна только последняя сделка, но берем 4 на случай,
+        // если последняя сделка еще не обновилась в API
+        const result = await api.getTradeHistory(symbol, 4);
         
         console.log('[UI] Trade history result:', result);
         
@@ -1915,12 +1987,27 @@ async function checkLastTradeForCommission(orders) {
     // Если комиссия больше 0 - останавливаем бота
     if (fee > 0) {
         console.log(`[UI] 🚨 Обнаружена комиссия в последней сделке: $${fee.toFixed(4)}, останавливаем бота`);
+        console.log(`[UI] Детали последней сделки:`, {
+            orderId: lastOrder.orderId || lastOrder.id,
+            symbol: lastOrder.symbol,
+            side: lastOrder.side,
+            totalFee: lastOrder.totalFee,
+            makerFee: lastOrder.makerFee,
+            takerFee: lastOrder.takerFee,
+            fee: lastOrder.fee,
+            commission: lastOrder.commission,
+            dealFee: lastOrder.dealFee,
+            dealFeeValue: lastOrder.dealFeeValue,
+            calculatedFee: fee
+        });
         log(`🚨 Обнаружена комиссия в последней сделке: $${fee.toFixed(4)}. Останавливаем бота...`, 'warning');
         
         try {
             const result = await api.request('/api/bot/stop-after-close', {
                 method: 'POST'
             });
+            
+            console.log(`[UI] Результат остановки бота:`, result);
             
             if (result.success) {
                 if (result.hasPosition) {
@@ -1930,6 +2017,10 @@ async function checkLastTradeForCommission(orders) {
                     // Обновляем статус
                     if (typeof updateArbitrageStatus === 'function') {
                         updateArbitrageStatus();
+                    }
+                    // Останавливаем все автоматические обновления
+                    if (typeof stopAllAutoUpdates === 'function') {
+                        stopAllAutoUpdates();
                     }
                     // Устанавливаем флаг, что бот остановлен
                     window.arbitrageBotRunning = false;
@@ -1941,6 +2032,9 @@ async function checkLastTradeForCommission(orders) {
             console.error('[UI] Ошибка остановки бота при обнаружении комиссии:', error);
             log(`❌ Ошибка остановки бота: ${error.message}`, 'error');
         }
+    } else {
+        // Логируем, что комиссия не обнаружена (для отладки)
+        console.log(`[UI] Комиссия не обнаружена в последней сделке (fee=${fee})`);
     }
 }
 
@@ -1989,6 +2083,435 @@ async function restartServer() {
         }
     } catch (error) {
         log(`Ошибка перезагрузки сервера: ${error.message}`, 'error');
+    }
+}
+
+// ==================== МУЛЬТИАККАУНТИНГ ====================
+
+// Переключение режима аккаунта
+async function switchAccountMode(mode, skipConfigLoad = false) {
+    try {
+        const singleAccountMode = document.getElementById('singleAccountMode');
+        const multiAccountSection = document.getElementById('multiAccountSection');
+        
+        if (!singleAccountMode || !multiAccountSection) {
+            console.error('[MULTI-ACCOUNT] Элементы не найдены:', { singleAccountMode, multiAccountSection });
+            return;
+        }
+        
+        // Обновляем состояние переключателей
+        const accountModeSingle = document.getElementById('accountModeSingle');
+        const accountModeMulti = document.getElementById('accountModeMulti');
+        
+        if (mode === 'single') {
+            if (accountModeSingle) accountModeSingle.checked = true;
+            if (accountModeMulti) accountModeMulti.checked = false;
+            singleAccountMode.style.display = 'block';
+            multiAccountSection.style.display = 'none';
+        } else {
+            if (accountModeSingle) accountModeSingle.checked = false;
+            if (accountModeMulti) accountModeMulti.checked = true;
+            singleAccountMode.style.display = 'none';
+            multiAccountSection.style.display = 'block';
+            
+            // Загружаем данные только если не пропущена загрузка конфигурации
+            if (!skipConfigLoad) {
+                await loadMultiAccountConfig(true); // Пропускаем переключение режима, чтобы избежать цикла
+            }
+            await loadMultiAccountAccounts();
+            await loadMultiAccountStatus();
+        }
+    } catch (error) {
+        console.error('[MULTI-ACCOUNT] Ошибка переключения режима:', error);
+        log(`Ошибка переключения режима: ${error.message}`, 'error');
+    }
+}
+
+// Делаем функцию доступной глобально
+window.switchAccountMode = switchAccountMode;
+
+// Загрузка конфигурации мультиаккаунтинга
+async function loadMultiAccountConfig(skipModeSwitch = false) {
+    try {
+        const result = await api.request('/api/multi-account/config');
+        if (result.success) {
+            const config = result.data;
+            const targetBalanceInput = document.getElementById('multiAccountTargetBalance');
+            const maxTimeInput = document.getElementById('multiAccountMaxTime');
+            
+            if (targetBalanceInput) {
+                targetBalanceInput.value = config.targetBalance || 0;
+            }
+            if (maxTimeInput) {
+                maxTimeInput.value = config.maxTradingTimeMinutes || 0;
+            }
+            
+            // Устанавливаем переключатель режима (только если не пропущен переключатель)
+            if (!skipModeSwitch) {
+                const singleRadio = document.getElementById('accountModeSingle');
+                const multiRadio = document.getElementById('accountModeMulti');
+                
+                if (singleRadio && multiRadio) {
+                    if (config.enabled) {
+                        multiRadio.checked = true;
+                        singleRadio.checked = false;
+                        // Вызываем switchAccountMode для обновления UI (но без повторной загрузки конфигурации)
+                        await switchAccountMode('multi', true);
+                    } else {
+                        singleRadio.checked = true;
+                        multiRadio.checked = false;
+                        // Вызываем switchAccountMode для обновления UI
+                        await switchAccountMode('single', true);
+                    }
+                }
+            }
+        }
+    } catch (error) {
+        console.error('Ошибка загрузки конфигурации мультиаккаунтинга:', error);
+    }
+}
+
+// Сохранение конфигурации мультиаккаунтинга
+async function saveMultiAccountConfig() {
+    try {
+        const targetBalance = parseFloat(document.getElementById('multiAccountTargetBalance').value) || 0;
+        const maxTime = parseInt(document.getElementById('multiAccountMaxTime').value) || 0;
+        const enabled = document.getElementById('accountModeMulti').checked;
+        
+        const result = await api.request('/api/multi-account/config', {
+            method: 'POST',
+            body: JSON.stringify({
+                enabled: enabled,
+                targetBalance: targetBalance,
+                maxTradingTimeMinutes: maxTime
+            })
+        });
+        
+        if (result.success) {
+            log('✓ Настройки мультиаккаунтинга сохранены', 'success');
+        } else {
+            log(`Ошибка сохранения: ${result.error}`, 'error');
+        }
+    } catch (error) {
+        log(`Ошибка сохранения настроек: ${error.message}`, 'error');
+    }
+}
+
+// Загрузка списка аккаунтов
+async function loadMultiAccountAccounts() {
+    try {
+        const result = await api.request('/api/multi-account/accounts');
+        if (result.success) {
+            renderMultiAccountList(result.data);
+        }
+    } catch (error) {
+        console.error('Ошибка загрузки списка аккаунтов:', error);
+    }
+}
+
+// Отрисовка списка аккаунтов
+function renderMultiAccountList(accounts) {
+    const listContainer = document.getElementById('multiAccountList');
+    
+    if (!accounts || accounts.length === 0) {
+        listContainer.innerHTML = `
+            <div style="padding: 12px; background: #1e293b; border: 1px solid #334155; border-radius: 4px; text-align: center; color: #94a3b8; font-size: 12px;">
+                Нет аккаунтов. Нажмите "Добавить аккаунт" для начала.
+            </div>
+        `;
+        return;
+    }
+    
+    // ВАЖНО: Сохраняем состояние открытых результатов проверки перед перерисовкой
+    const visibleTestResults = {};
+    accounts.forEach(account => {
+        const resultContainer = document.getElementById(`test-result-${account.id}`);
+        if (resultContainer && resultContainer.style.display !== 'none' && resultContainer.innerHTML.trim()) {
+            visibleTestResults[account.id] = resultContainer.innerHTML;
+        }
+    });
+    
+    listContainer.innerHTML = accounts.map(account => {
+        const statusColors = {
+            'idle': '#94a3b8',
+            'trading': '#22c55e',
+            'stopped': '#f59e0b',
+            'error': '#ef4444'
+        };
+        const statusTexts = {
+            'idle': 'Ожидание',
+            'trading': 'Торговля',
+            'stopped': 'Остановлен',
+            'error': 'Ошибка'
+        };
+        
+        return `
+            <div class="account-item" data-account-id="${account.id}" style="padding: 12px; background: #1e293b; border: 1px solid #334155; border-radius: 4px;">
+                <div style="display: flex; justify-content: space-between; align-items: start; margin-bottom: 12px;">
+                    <div style="flex: 1;">
+                        <div style="font-weight: bold; margin-bottom: 4px;">${account.name || `Аккаунт ${accounts.indexOf(account) + 1}`}</div>
+                        <div style="font-size: 11px; color: #94a3b8;">
+                            API Key: ${account.apiKeyPreview}<br>
+                            API Secret: ${account.apiSecretPreview}<br>
+                            WEB Token: ${account.webTokenPreview}
+                        </div>
+                    </div>
+                    <div style="text-align: right;">
+                        <span style="padding: 4px 8px; background: ${statusColors[account.status] || '#94a3b8'}; border-radius: 4px; font-size: 11px; color: white;">
+                            ${statusTexts[account.status] || account.status}
+                        </span>
+                    </div>
+                </div>
+                
+                ${account.initialBalance !== undefined ? `
+                    <div style="font-size: 11px; color: #94a3b8; margin-bottom: 4px;">
+                        Начальный баланс: <strong style="color: white;">${account.initialBalance.toFixed(2)} USDT</strong>
+                    </div>
+                ` : ''}
+                
+                ${account.currentBalance !== undefined ? `
+                    <div style="font-size: 11px; color: #94a3b8; margin-bottom: 4px;">
+                        Текущий баланс: <strong style="color: white;">${account.currentBalance.toFixed(2)} USDT</strong>
+                    </div>
+                ` : ''}
+                
+                ${account.tradesCount > 0 ? `
+                    <div style="font-size: 11px; color: #94a3b8; margin-bottom: 4px;">
+                        Сделок: <strong style="color: white;">${account.tradesCount}</strong>
+                    </div>
+                ` : ''}
+                
+                ${account.stopReason ? `
+                    <div style="font-size: 11px; color: #f59e0b; margin-bottom: 8px; padding: 4px; background: #1e293b; border-radius: 4px;">
+                        Причина остановки: ${account.stopReason}
+                    </div>
+                ` : ''}
+                
+                <div id="test-result-${account.id}" style="display: none; margin-bottom: 8px; padding: 8px; background: #1e293b; border-radius: 4px; border: 1px solid #334155;">
+                    <!-- Результат проверки будет отображаться здесь -->
+                </div>
+                
+                <div style="display: flex; gap: 4px; margin-top: 8px;">
+                    <button class="btn-secondary" onclick="testMultiAccount('${account.id}')" style="flex: 1; padding: 4px 8px; font-size: 11px;">Проверить</button>
+                    <button class="btn-danger" onclick="deleteMultiAccount('${account.id}')" style="flex: 1; padding: 4px 8px; font-size: 11px;">Удалить</button>
+                </div>
+            </div>
+        `;
+    }).join('');
+    
+    // ВАЖНО: Восстанавливаем состояние открытых результатов проверки после перерисовки
+    Object.keys(visibleTestResults).forEach(accountId => {
+        const resultContainer = document.getElementById(`test-result-${accountId}`);
+        if (resultContainer && visibleTestResults[accountId]) {
+            resultContainer.style.display = 'block';
+            resultContainer.innerHTML = visibleTestResults[accountId];
+        }
+    });
+}
+
+// Добавление нового аккаунта
+function addMultiAccount() {
+    const listContainer = document.getElementById('multiAccountList');
+    
+    const newAccountHtml = `
+        <div class="new-account-form" style="padding: 12px; background: #1e293b; border: 2px solid #60a5fa; border-radius: 4px;">
+            <div style="font-weight: bold; margin-bottom: 12px; color: #60a5fa;">➕ Новый аккаунт</div>
+            <div class="form-group" style="margin-bottom: 8px;">
+                <label style="font-size: 11px; color: #94a3b8;">Название аккаунта:</label>
+                <input type="text" class="new-account-name" placeholder="Мой аккаунт 1" style="width: 100%; padding: 6px; background: #0f172a; border: 1px solid #334155; border-radius: 4px; color: white; font-size: 12px;" />
+            </div>
+            <div class="form-group" style="margin-bottom: 8px;">
+                <label style="font-size: 11px; color: #94a3b8;">API Key:</label>
+                <input type="password" class="new-account-apiKey" placeholder="Ваш API Key" style="width: 100%; padding: 6px; background: #0f172a; border: 1px solid #334155; border-radius: 4px; color: white; font-size: 12px;" />
+            </div>
+            <div class="form-group" style="margin-bottom: 8px;">
+                <label style="font-size: 11px; color: #94a3b8;">API Secret:</label>
+                <input type="password" class="new-account-apiSecret" placeholder="Ваш API Secret" style="width: 100%; padding: 6px; background: #0f172a; border: 1px solid #334155; border-radius: 4px; color: white; font-size: 12px;" />
+            </div>
+            <div class="form-group" style="margin-bottom: 12px;">
+                <label style="font-size: 11px; color: #94a3b8;">WEB Token:</label>
+                <input type="password" class="new-account-webToken" placeholder="WEB_..." style="width: 100%; padding: 6px; background: #0f172a; border: 1px solid #334155; border-radius: 4px; color: white; font-size: 12px;" />
+            </div>
+            <div style="display: flex; gap: 4px;">
+                <button class="btn-success" onclick="saveNewAccount(this)" style="flex: 1; padding: 6px; font-size: 12px;">Сохранить</button>
+                <button class="btn-secondary" onclick="cancelNewAccount(this)" style="flex: 1; padding: 6px; font-size: 12px;">Отмена</button>
+            </div>
+        </div>
+    `;
+    
+    listContainer.insertAdjacentHTML('beforeend', newAccountHtml);
+}
+
+// Сохранение нового аккаунта
+async function saveNewAccount(button) {
+    const form = button.closest('.new-account-form');
+    const name = form.querySelector('.new-account-name')?.value.trim() || '';
+    const apiKey = form.querySelector('.new-account-apiKey').value.trim();
+    const apiSecret = form.querySelector('.new-account-apiSecret').value.trim();
+    const webToken = form.querySelector('.new-account-webToken').value.trim();
+    
+    if (!apiKey || !apiSecret || !webToken) {
+        log('API Key, API Secret и WEB Token обязательны для заполнения', 'error');
+        return;
+    }
+    
+    try {
+        const result = await api.request('/api/multi-account/accounts', {
+            method: 'POST',
+            body: JSON.stringify({ name, apiKey, apiSecret, webToken })
+        });
+        
+        if (result.success) {
+            log('✓ Аккаунт успешно добавлен и проверен', 'success');
+            await loadMultiAccountAccounts();
+        } else {
+            log(`Ошибка добавления аккаунта: ${result.error}`, 'error');
+        }
+    } catch (error) {
+        log(`Ошибка добавления аккаунта: ${error.message}`, 'error');
+    }
+}
+
+// Отмена добавления аккаунта
+function cancelNewAccount(button) {
+    const form = button.closest('.new-account-form');
+    form.remove();
+}
+
+// Удаление аккаунта
+async function deleteMultiAccount(accountId) {
+    if (!confirm('Вы уверены, что хотите удалить этот аккаунт?')) {
+        return;
+    }
+    
+    try {
+        const result = await api.request(`/api/multi-account/accounts/${accountId}`, {
+            method: 'DELETE'
+        });
+        
+        if (result.success) {
+            log('✓ Аккаунт успешно удален', 'success');
+            await loadMultiAccountAccounts();
+        } else {
+            log(`Ошибка удаления аккаунта: ${result.error}`, 'error');
+        }
+    } catch (error) {
+        log(`Ошибка удаления аккаунта: ${error.message}`, 'error');
+    }
+}
+
+// Проверка ключей аккаунта
+async function testMultiAccount(accountId) {
+    const resultContainer = document.getElementById(`test-result-${accountId}`);
+    if (!resultContainer) {
+        log('Ошибка: контейнер для результата не найден', 'error');
+        return;
+    }
+    
+    // Показываем индикатор загрузки
+    resultContainer.style.display = 'block';
+    resultContainer.innerHTML = `
+        <div style="display: flex; align-items: center; gap: 8px; color: #94a3b8; font-size: 11px;">
+            <span>⏳ Проверка ключей...</span>
+        </div>
+    `;
+    
+    try {
+        const result = await api.request(`/api/multi-account/accounts/${accountId}/test`, {
+            method: 'POST'
+        });
+        
+        if (result.success && result.data) {
+            const data = result.data;
+            const balance = data.balance !== null && data.balance !== undefined ? data.balance.toFixed(2) : 'N/A';
+            
+            // Все ключи валидны
+            resultContainer.innerHTML = `
+                <div style="display: flex; align-items: center; gap: 8px;">
+                    <span style="font-size: 16px; color: #22c55e;">✅</span>
+                    <div style="flex: 1;">
+                        <div style="color: #22c55e; font-weight: bold; font-size: 12px; margin-bottom: 2px;">Все ключи проверены успешно</div>
+                        <div style="color: #94a3b8; font-size: 11px;">Текущий баланс: <strong style="color: white;">${balance} USDT</strong></div>
+                    </div>
+                </div>
+            `;
+            log(`✓ Все ключи проверены успешно. Баланс: ${balance} USDT`, 'success');
+        } else {
+            // Есть ошибки
+            const errorMsg = result.error || result.message || 'Неизвестная ошибка';
+            resultContainer.innerHTML = `
+                <div style="display: flex; align-items: center; gap: 8px;">
+                    <span style="font-size: 16px; color: #ef4444;">❌</span>
+                    <div style="flex: 1;">
+                        <div style="color: #ef4444; font-weight: bold; font-size: 12px; margin-bottom: 2px;">Ошибка проверки ключей</div>
+                        <div style="color: #f59e0b; font-size: 11px;">${errorMsg}</div>
+                    </div>
+                </div>
+            `;
+            log(`Ошибка проверки ключей: ${errorMsg}`, 'error');
+        }
+    } catch (error) {
+        resultContainer.innerHTML = `
+            <div style="display: flex; align-items: center; gap: 8px;">
+                <span style="font-size: 16px; color: #ef4444;">❌</span>
+                <div style="flex: 1;">
+                    <div style="color: #ef4444; font-weight: bold; font-size: 12px; margin-bottom: 2px;">Ошибка проверки</div>
+                    <div style="color: #f59e0b; font-size: 11px;">${error.message}</div>
+                </div>
+            </div>
+        `;
+        log(`Ошибка проверки ключей: ${error.message}`, 'error');
+    }
+}
+
+// Загрузка статуса мультиаккаунтинга
+async function loadMultiAccountStatus() {
+    try {
+        const result = await api.request('/api/multi-account/status');
+        if (result.success) {
+            const status = result.data;
+            const statusContainer = document.getElementById('multiAccountStatus');
+            
+            let statusHtml = '';
+            
+            if (status.enabled) {
+                statusHtml += `<div style="margin-bottom: 8px;"><strong>Режим:</strong> <span style="color: #22c55e;">Мультиаккаунтинг включен</span></div>`;
+                statusHtml += `<div style="margin-bottom: 8px;"><strong>Всего аккаунтов:</strong> ${status.totalAccounts}</div>`;
+                
+                if (status.currentAccount) {
+                    statusHtml += `<div style="margin-bottom: 8px; padding: 8px; background: #0f172a; border-radius: 4px;">`;
+                    statusHtml += `<div><strong>Текущий аккаунт:</strong> ${status.currentAccount.preview}</div>`;
+                    if (status.currentAccount.initialBalance !== undefined) {
+                        statusHtml += `<div style="font-size: 11px; color: #94a3b8; margin-top: 4px;">Начальный баланс: ${status.currentAccount.initialBalance.toFixed(2)} USDT</div>`;
+                    }
+                    if (status.currentAccount.currentBalance !== undefined) {
+                        statusHtml += `<div style="font-size: 11px; color: #94a3b8;">Текущий баланс: ${status.currentAccount.currentBalance.toFixed(2)} USDT</div>`;
+                    }
+                    if (status.currentAccount.tradesCount > 0) {
+                        statusHtml += `<div style="font-size: 11px; color: #94a3b8;">Сделок: ${status.currentAccount.tradesCount}</div>`;
+                    }
+                    statusHtml += `</div>`;
+                } else {
+                    statusHtml += `<div style="color: #94a3b8;">Нет активного аккаунта</div>`;
+                }
+                
+                if (status.logs && status.logs.length > 0) {
+                    statusHtml += `<div style="margin-top: 12px; padding-top: 12px; border-top: 1px solid #334155;">`;
+                    statusHtml += `<div style="font-weight: bold; margin-bottom: 8px; font-size: 12px;">Последние события:</div>`;
+                    status.logs.slice(-5).reverse().forEach(log => {
+                        const time = new Date(log.timestamp).toLocaleTimeString();
+                        statusHtml += `<div style="font-size: 11px; color: #94a3b8; margin-bottom: 4px;">[${time}] ${log.event.toUpperCase()}: ${log.message}</div>`;
+                    });
+                    statusHtml += `</div>`;
+                }
+            } else {
+                statusHtml = `<div style="color: #94a3b8;">Мультиаккаунтинг выключен</div>`;
+            }
+            
+            statusContainer.innerHTML = statusHtml;
+        }
+    } catch (error) {
+        console.error('Ошибка загрузки статуса мультиаккаунтинга:', error);
     }
 }
 

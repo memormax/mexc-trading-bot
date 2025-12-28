@@ -46,7 +46,10 @@ async function updateArbitrageStatus() {
                         const apiSecret = document.getElementById('apiSecret')?.value?.trim();
                         if (apiKey && apiSecret && typeof loadTradeHistory === 'function') {
                             console.log('[ARBITRAGE] Обнаружено закрытие позиции, обновляем историю сделок...');
-                            await loadTradeHistory();
+                            // Добавляем задержку, чтобы дать время MEXC обновить историю сделок
+                            setTimeout(async () => {
+                                await loadTradeHistory();
+                            }, 3000); // 3 секунды задержки для обновления истории на MEXC
                         }
                     }
                 } catch (error) {
@@ -172,20 +175,47 @@ async function restartArbitrageBot() {
     }
 }
 
+// Переключение видимости настроек Автообъема
+function toggleAutoVolume() {
+    const autoVolumeEnabled = document.getElementById('autoVolumeEnabled').checked;
+    const autoVolumeSettings = document.getElementById('autoVolumeSettings');
+    
+    if (autoVolumeSettings) {
+        autoVolumeSettings.style.display = autoVolumeEnabled ? 'block' : 'none';
+    }
+}
+
 // Сохранение настроек арбитража
 async function saveArbitrageSettings() {
     try {
         const minTicks = parseFloat(document.getElementById('minTicks').value);
         const maxSlippage = parseFloat(document.getElementById('maxSlippage').value);
+        const autoLeverage = parseInt(document.getElementById('autoLeverage').value) || 10;
+        const autoVolumeEnabled = document.getElementById('autoVolumeEnabled').checked;
+        const autoVolumePercent = parseFloat(document.getElementById('autoVolumePercent').value) || 90;
+        const autoVolumeMax = parseFloat(document.getElementById('autoVolumeMax').value) || 3500;
+        const marginMode = document.getElementById('marginMode').value || 'isolated';
+        const minBalanceForTrading = parseFloat(document.getElementById('minBalanceForTrading').value) || 0.5;
         
-        // Объем берется из "Параметры ордера", не из настроек
-        const result = await api.updateSettings({
+        const settings = {
             minTickDifference: minTicks,
-            maxSlippagePercent: maxSlippage
-        });
+            maxSlippagePercent: maxSlippage,
+            autoLeverage: autoLeverage,
+            autoVolumeEnabled: autoVolumeEnabled,
+            autoVolumePercent: autoVolumePercent,
+            autoVolumeMax: autoVolumeMax,
+            marginMode: marginMode,
+            minBalanceForTrading: minBalanceForTrading
+        };
+        
+        const result = await api.updateSettings(settings);
         
         if (result.success) {
             log('✓ Настройки арбитража сохранены', 'success');
+            // Если автообъем включен, обновляем объем сразу
+            if (autoVolumeEnabled) {
+                log('🔄 Автообъем включен. Объем будет рассчитан автоматически при следующей сделке.', 'info');
+            }
         } else {
             log(`Ошибка сохранения: ${result.error}`, 'error');
         }
@@ -224,19 +254,36 @@ function initArbitrage() {
             const settings = result.data;
             const minTicksEl = document.getElementById('minTicks');
             const maxSlippageEl = document.getElementById('maxSlippage');
+            const autoLeverageEl = document.getElementById('autoLeverage');
+            const autoVolumeEnabledEl = document.getElementById('autoVolumeEnabled');
+            const autoVolumePercentEl = document.getElementById('autoVolumePercent');
+            const autoVolumeMaxEl = document.getElementById('autoVolumeMax');
+            const marginModeEl = document.getElementById('marginMode');
+            const minBalanceForTradingEl = document.getElementById('minBalanceForTrading');
             
             if (minTicksEl) minTicksEl.value = settings.minTickDifference || 2;
             if (maxSlippageEl) maxSlippageEl.value = settings.maxSlippagePercent || 0.1;
+            if (autoLeverageEl) autoLeverageEl.value = settings.autoLeverage || 10;
+            if (autoVolumeEnabledEl) {
+                autoVolumeEnabledEl.checked = settings.autoVolumeEnabled || false;
+                toggleAutoVolume(); // Обновляем видимость настроек
+            }
+            if (autoVolumePercentEl) autoVolumePercentEl.value = settings.autoVolumePercent || 90;
+            if (autoVolumeMaxEl) autoVolumeMaxEl.value = settings.autoVolumeMax || 3500;
+            if (marginModeEl) marginModeEl.value = settings.marginMode || 'isolated';
+            if (minBalanceForTradingEl) minBalanceForTradingEl.value = settings.minBalanceForTrading || 0.5;
             
-            // Объем берется из "Параметры ордера", устанавливаем его при загрузке
-            const volumeInput = document.getElementById('volume');
-            if (volumeInput && settings.positionSize) {
-                const volumeType = document.querySelector('input[name="volumeType"]:checked')?.value || 'usdt';
-                if (volumeType === 'usdt') {
-                    volumeInput.value = settings.positionSize;
-                    // Обновляем расчеты и отправляем объем на сервер
-                    if (typeof updateVolumeCalculations === 'function') {
-                        updateVolumeCalculations();
+            // Объем берется из "Параметры ордера" только если автообъем выключен
+            if (!settings.autoVolumeEnabled) {
+                const volumeInput = document.getElementById('volume');
+                if (volumeInput && settings.positionSize) {
+                    const volumeType = document.querySelector('input[name="volumeType"]:checked')?.value || 'usdt';
+                    if (volumeType === 'usdt') {
+                        volumeInput.value = settings.positionSize;
+                        // Обновляем расчеты и отправляем объем на сервер
+                        if (typeof updateVolumeCalculations === 'function') {
+                            updateVolumeCalculations();
+                        }
                     }
                 }
             }
