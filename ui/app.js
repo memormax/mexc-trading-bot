@@ -1,5 +1,5 @@
 // Глобальные переменные
-let currentSymbol = 'BTC_USDT';
+let currentSymbol = 'UNI_USDT';
 let currentPrice = 0;
 let currentBid = 0;
 let currentAsk = 0;
@@ -433,7 +433,7 @@ function getSelectedSymbol() {
     const select = document.getElementById('symbol');
     const custom = document.getElementById('customSymbol');
     const customValue = custom ? custom.value.trim() : '';
-    return customValue || (select ? select.value : 'BTC_USDT');
+    return customValue || (select ? select.value : 'UNI_USDT');
 }
 
 async function loadMarketData() {
@@ -2263,23 +2263,41 @@ function renderMultiAccountList(accounts) {
                     </div>
                 </div>
                 
-                ${account.initialBalance !== undefined ? `
-                    <div style="font-size: 11px; color: #94a3b8; margin-bottom: 4px;">
-                        Начальный баланс: <strong style="color: white;">${account.initialBalance.toFixed(2)} USDT</strong>
+                <div style="display: flex; gap: 16px; margin-bottom: 8px;">
+                    <div style="flex: 1;">
+                        ${account.initialBalance !== undefined ? `
+                            <div style="font-size: 11px; color: #94a3b8; margin-bottom: 4px;">
+                                Начальный баланс: <strong style="color: white;">${account.initialBalance.toFixed(2)} USDT</strong>
+                            </div>
+                        ` : ''}
+                        
+                        ${account.currentBalance !== undefined ? `
+                            <div style="font-size: 11px; color: #94a3b8; margin-bottom: 4px;">
+                                Текущий баланс: <strong style="color: white;">${account.currentBalance.toFixed(2)} USDT</strong>
+                            </div>
+                        ` : ''}
+                        
+                        ${account.tradesCount > 0 ? `
+                            <div style="font-size: 11px; color: #94a3b8; margin-bottom: 4px;">
+                                Сделок: <strong style="color: white;">${account.tradesCount}</strong>
+                            </div>
+                        ` : ''}
                     </div>
-                ` : ''}
-                
-                ${account.currentBalance !== undefined ? `
-                    <div style="font-size: 11px; color: #94a3b8; margin-bottom: 4px;">
-                        Текущий баланс: <strong style="color: white;">${account.currentBalance.toFixed(2)} USDT</strong>
+                    
+                    <div style="flex: 1;">
+                        ${account.totalTradedVolumeFormatted ? `
+                            <div style="font-size: 11px; color: #94a3b8; margin-bottom: 4px;">
+                                Проторговано: <strong style="color: white;">${account.totalTradedVolumeFormatted}</strong>
+                            </div>
+                        ` : ''}
+                        
+                        ${account.tradingTimeFormatted ? `
+                            <div style="font-size: 11px; color: #94a3b8; margin-bottom: 4px;">
+                                Время: <strong style="color: white;">${account.tradingTimeFormatted}</strong>
+                            </div>
+                        ` : ''}
                     </div>
-                ` : ''}
-                
-                ${account.tradesCount > 0 ? `
-                    <div style="font-size: 11px; color: #94a3b8; margin-bottom: 4px;">
-                        Сделок: <strong style="color: white;">${account.tradesCount}</strong>
-                    </div>
-                ` : ''}
+                </div>
                 
                 ${account.stopReason ? `
                     <div style="font-size: 11px; color: #f59e0b; margin-bottom: 8px; padding: 4px; background: #1e293b; border-radius: 4px;">
@@ -2316,21 +2334,12 @@ function addMultiAccount() {
     const newAccountHtml = `
         <div class="new-account-form" style="padding: 12px; background: #1e293b; border: 2px solid #60a5fa; border-radius: 4px;">
             <div style="font-weight: bold; margin-bottom: 12px; color: #60a5fa;">➕ Новый аккаунт</div>
-            <div class="form-group" style="margin-bottom: 8px;">
-                <label style="font-size: 11px; color: #94a3b8;">Название аккаунта:</label>
-                <input type="text" class="new-account-name" placeholder="Мой аккаунт 1" style="width: 100%; padding: 6px; background: #0f172a; border: 1px solid #334155; border-radius: 4px; color: white; font-size: 12px;" />
-            </div>
-            <div class="form-group" style="margin-bottom: 8px;">
-                <label style="font-size: 11px; color: #94a3b8;">API Key:</label>
-                <input type="password" class="new-account-apiKey" placeholder="Ваш API Key" style="width: 100%; padding: 6px; background: #0f172a; border: 1px solid #334155; border-radius: 4px; color: white; font-size: 12px;" />
-            </div>
-            <div class="form-group" style="margin-bottom: 8px;">
-                <label style="font-size: 11px; color: #94a3b8;">API Secret:</label>
-                <input type="password" class="new-account-apiSecret" placeholder="Ваш API Secret" style="width: 100%; padding: 6px; background: #0f172a; border: 1px solid #334155; border-radius: 4px; color: white; font-size: 12px;" />
-            </div>
             <div class="form-group" style="margin-bottom: 12px;">
-                <label style="font-size: 11px; color: #94a3b8;">WEB Token:</label>
-                <input type="password" class="new-account-webToken" placeholder="WEB_..." style="width: 100%; padding: 6px; background: #0f172a; border: 1px solid #334155; border-radius: 4px; color: white; font-size: 12px;" />
+                <label style="font-size: 11px; color: #94a3b8; margin-bottom: 4px; display: block;">Введите данные построчно (4 строки):</label>
+                <textarea class="new-account-data" placeholder="Название аккаунта&#10;API Key&#10;API Secret&#10;WEB Token" rows="4" style="width: 100%; padding: 8px; background: #0f172a; border: 1px solid #334155; border-radius: 4px; color: white; font-size: 12px; font-family: monospace; resize: vertical; min-height: 80px;"></textarea>
+                <div style="font-size: 10px; color: #64748b; margin-top: 4px;">
+                    Формат: каждая строка = одно поле (Название, API Key, API Secret, WEB Token)
+                </div>
             </div>
             <div style="display: flex; gap: 4px;">
                 <button class="btn-success" onclick="saveNewAccount(this)" style="flex: 1; padding: 6px; font-size: 12px;">Сохранить</button>
@@ -2345,10 +2354,25 @@ function addMultiAccount() {
 // Сохранение нового аккаунта
 async function saveNewAccount(button) {
     const form = button.closest('.new-account-form');
-    const name = form.querySelector('.new-account-name')?.value.trim() || '';
-    const apiKey = form.querySelector('.new-account-apiKey').value.trim();
-    const apiSecret = form.querySelector('.new-account-apiSecret').value.trim();
-    const webToken = form.querySelector('.new-account-webToken').value.trim();
+    const textarea = form.querySelector('.new-account-data');
+    
+    if (!textarea) {
+        log('Ошибка: поле ввода не найдено', 'error');
+        return;
+    }
+    
+    // Парсим данные построчно
+    const lines = textarea.value.split('\n').map(line => line.trim()).filter(line => line.length > 0);
+    
+    if (lines.length < 4) {
+        log('Ошибка: необходимо ввести 4 строки (Название, API Key, API Secret, WEB Token)', 'error');
+        return;
+    }
+    
+    const name = lines[0] || '';
+    const apiKey = lines[1] || '';
+    const apiSecret = lines[2] || '';
+    const webToken = lines[3] || '';
     
     if (!apiKey || !apiSecret || !webToken) {
         log('API Key, API Secret и WEB Token обязательны для заполнения', 'error');
@@ -2489,6 +2513,12 @@ async function loadMultiAccountStatus() {
                     }
                     if (status.currentAccount.tradesCount > 0) {
                         statusHtml += `<div style="font-size: 11px; color: #94a3b8;">Сделок: ${status.currentAccount.tradesCount}</div>`;
+                    }
+                    if (status.currentAccount.totalTradedVolumeFormatted) {
+                        statusHtml += `<div style="font-size: 11px; color: #94a3b8;">Проторговано: ${status.currentAccount.totalTradedVolumeFormatted}</div>`;
+                    }
+                    if (status.currentAccount.tradingTimeFormatted) {
+                        statusHtml += `<div style="font-size: 11px; color: #94a3b8;">Время торговли: ${status.currentAccount.tradingTimeFormatted}</div>`;
                     }
                     statusHtml += `</div>`;
                 } else {

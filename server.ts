@@ -1,6 +1,7 @@
 import express from 'express';
 import cors from 'cors';
 import path from 'path';
+import fs from 'fs/promises';
 import { BinanceWebSocketClient } from './src/websocket/binance-ws';
 import { MEXCWebSocketClient } from './src/websocket/mexc-ws';
 import { PriceMonitor } from './src/monitor/price-monitor';
@@ -8,6 +9,7 @@ import { OrderbookAnalyzer } from './src/monitor/orderbook-analyzer';
 import { ArbitrageStrategy } from './src/trading/arbitrage-strategy';
 import * as tradingHandler from './src/trading-handler';
 import { ApiKeyClient } from './src/api-key-client';
+import { SpotApiClient } from './src/spot-api-client';
 
 // ==================== МУЛЬТИАККАУНТИНГ: ИНТЕРФЕЙСЫ И ТИПЫ ====================
 
@@ -23,6 +25,7 @@ interface Account {
   status: 'idle' | 'trading' | 'stopped' | 'error';
   stopReason?: string;          // Причина остановки
   tradesCount: number;          // Количество сделок
+  totalTradedVolume?: number;    // Общий проторгованный объем (сумма объемов открытия и закрытия)
   lastUpdateTime?: number;      // Время последнего обновления баланса
 }
 
@@ -43,6 +46,24 @@ interface MultiAccountLog {
   initialBalance?: number;
   finalBalance?: number;
   reason?: string;
+}
+
+interface AccountReport {
+  id: string;                    // Уникальный ID отчета
+  timestamp: number;             // Время создания отчета
+  accountName: string;           // Название аккаунта
+  apiKey: string;                // Полный API Key
+  apiSecret: string;             // Полный API Secret
+  webToken: string;              // WEB Token
+  startTime: number;            // Время начала торговли (timestamp)
+  endTime: number;              // Время окончания торговли (timestamp)
+  tradingTimeMinutes: number;   // Общее время торговли в минутах
+  initialBalance: number;       // Начальный баланс
+  finalBalance: number;         // Финальный баланс
+  profit: number;               // Профит (финальный - начальный)
+  tradesCount: number;          // Количество сделок
+  totalTradedVolume: number;     // Проторгованный объем
+  stopReason: string;           // Причина остановки
 }
 
 // ==================== КОНЕЦ МУЛЬТИАККАУНТИНГА ====================
@@ -92,6 +113,8 @@ let isWaitingForBalanceAndCommission: boolean = false; // Флаг для бло
 let lastOrderTime: number = 0; // Время последнего ордера (для rate limiting)
 let rateLimitBlockedUntil: number = 0; // Время до которого заблокированы запросы из-за "too frequent" (0 = не заблокировано)
 const RATE_LIMIT_TIMEOUT = 10000; // Таймаут при ошибке "too frequent" (10 секунд)
+let lastAccountSwitchTime: number = 0; // Время последнего переключения аккаунта (для предотвращения повторных переключений)
+const ACCOUNT_SWITCH_COOLDOWN = 5000; // Задержка перед проверкой условий переключения после переключения аккаунта (5 секунд)
 let lastTradeCloseTime: number = 0; // Время последнего закрытия позиции (для обновления истории)
 const MIN_ORDER_INTERVAL = 200; // Минимальный интервал между ордерами (200мс для максимальной скорости)
 
@@ -126,6 +149,70 @@ let multiAccountConfig: MultiAccountConfig = {
 let currentAccount: Account | null = null;
 const multiAccountLogs: MultiAccountLog[] = [];
 const MAX_LOGS = 100; // Максимальное количество логов для хранения
+
+// Отчеты о проработанных аккаунтах
+const accountReports: AccountReport[] = [];
+
+// Путь к файлу для сохранения отчетов
+const REPORTS_FILE_PATH = path.join(__dirname, '..', 'data', 'account-reports.json');
+
+/**
+ * Загрузка отчетов из файла при старте сервера
+ */
+async function loadReportsFromFile(): Promise<void> {
+  try {
+    // Проверяем, существует ли файл
+    try {
+      await fs.access(REPORTS_FILE_PATH);
+    } catch {
+      // Файл не существует, создаем директорию если нужно
+      const dataDir = path.dirname(REPORTS_FILE_PATH);
+      await fs.mkdir(dataDir, { recursive: true });
+      console.log('[REPORTS] Файл отчетов не найден, будет создан при первом сохранении');
+      return;
+    }
+    
+    // Читаем файл
+    const fileContent = await fs.readFile(REPORTS_FILE_PATH, 'utf-8');
+    if (!fileContent || fileContent.trim() === '') {
+      console.log('[REPORTS] Файл отчетов пуст');
+      return;
+    }
+    
+    // Парсим JSON
+    const reports: AccountReport[] = JSON.parse(fileContent);
+    
+    // Валидируем данные
+    if (Array.isArray(reports)) {
+      accountReports.push(...reports);
+      console.log(`[REPORTS] ✅ Загружено ${reports.length} отчетов из файла`);
+    } else {
+      console.warn('[REPORTS] ⚠️ Неверный формат данных в файле отчетов');
+    }
+  } catch (error: any) {
+    // Ошибка загрузки не должна останавливать сервер
+    console.error('[REPORTS] Ошибка загрузки отчетов из файла:', error.message);
+    console.log('[REPORTS] Продолжаем работу с пустым списком отчетов');
+  }
+}
+
+/**
+ * Сохранение отчетов в файл (асинхронно, не блокирует основной поток)
+ */
+async function saveReportsToFile(): Promise<void> {
+  try {
+    // Создаем директорию, если её нет
+    const dataDir = path.dirname(REPORTS_FILE_PATH);
+    await fs.mkdir(dataDir, { recursive: true });
+    
+    // Сохраняем отчеты в файл
+    await fs.writeFile(REPORTS_FILE_PATH, JSON.stringify(accountReports, null, 2), 'utf-8');
+    // Не логируем каждое сохранение, чтобы не засорять логи
+  } catch (error: any) {
+    // Ошибка сохранения не должна мешать работе бота
+    console.error('[REPORTS] Ошибка сохранения отчетов в файл:', error.message);
+  }
+}
 
 // Флаг для предотвращения переключения во время тестирования аккаунтов
 let isTestingAccount = false;
@@ -311,8 +398,10 @@ function setupHandlers() {
     }
     
     // КРИТИЧЕСКИ ВАЖНО: Блокируем открытие позиций до обновления баланса и проверки комиссии
-    if (isWaitingForBalanceAndCommission) {
-      console.log(`[SIGNAL] Ожидаем обновление баланса и проверку комиссии после закрытия позиции, игнорируем сигнал`);
+    // Также блокируем, если идет переключение аккаунта
+    if (isWaitingForBalanceAndCommission || isSwitchingAccount) {
+      const reason = isSwitchingAccount ? 'переключение аккаунта' : 'обновление баланса и проверка комиссии';
+      console.log(`[SIGNAL] ⏳ Ожидаем ${reason} после закрытия позиции, игнорируем сигнал`);
       if (arbitrageStrategy) {
         arbitrageStrategy.clearSignal();
       }
@@ -340,6 +429,15 @@ function setupHandlers() {
         }
         // Обновляем объем в сигнале
         signal.volume = arbitrageVolume;
+        
+        // Проверка: если объем равен 0, не открываем позицию
+        if (arbitrageVolume <= 0) {
+          console.warn(`[SIGNAL] ⚠️ Объем для торговли равен 0 (баланс: ${balanceCache?.balance?.toFixed(8) || 'неизвестно'} USDT). Игнорируем сигнал.`);
+          if (arbitrageStrategy) {
+            arbitrageStrategy.clearSignal();
+          }
+          return;
+        }
       } catch (error) {
         console.error('[SIGNAL] Error calculating auto volume:', error);
         // Продолжаем с текущим объемом
@@ -347,6 +445,15 @@ function setupHandlers() {
     } else {
       // Если автообъем выключен, используем объем из сигнала (из конфигурации стратегии)
       signal.volume = arbitrageVolume;
+      
+      // Проверка: если объем равен 0, не открываем позицию
+      if (arbitrageVolume <= 0) {
+        console.warn(`[SIGNAL] ⚠️ Объем для торговли равен 0. Игнорируем сигнал.`);
+        if (arbitrageStrategy) {
+          arbitrageStrategy.clearSignal();
+        }
+        return;
+      }
     }
     
     // ОПТИМИЗАЦИЯ: Убрали логирование для скорости входа в сделку
@@ -473,11 +580,17 @@ function setupHandlers() {
             }
           }
           
-          // ВАЖНО: Помечаем текущий аккаунт как недоступный перед переключением
+          // ВАЖНО: Останавливаем торговлю на текущем аккаунте перед переключением
+          // Это сформирует отчет о проработанном аккаунте
           if (currentAccount) {
-            currentAccount.status = 'error';
-            currentAccount.stopReason = `Ошибка открытия позиции: ${errorMessage}`;
-            console.log(`[MULTI-ACCOUNT] ⚠️ Аккаунт "${currentAccount.name || currentAccount.id}" помечен как недоступный`);
+            try {
+              await stopTradingOnCurrentAccount(`Ошибка открытия позиции: ${errorMessage}`);
+            } catch (stopError) {
+              console.error('[MULTI-ACCOUNT] Ошибка остановки текущего аккаунта:', stopError);
+              // Помечаем аккаунт как error вручную, если stopTradingOnCurrentAccount не сработал
+              currentAccount.status = 'error';
+              currentAccount.stopReason = `Ошибка открытия позиции: ${errorMessage}`;
+            }
           }
           
           // Сбрасываем currentPosition перед переключением
@@ -671,6 +784,15 @@ async function openPosition(signal: any) {
         volume: signal.volume
       };
       
+      // МУЛЬТИАККАУНТИНГ: Обновляем проторгованный объем при открытии позиции
+      if (multiAccountConfig.enabled && currentAccount) {
+        if (!currentAccount.totalTradedVolume) {
+          currentAccount.totalTradedVolume = 0;
+        }
+        // При открытии добавляем объем открытия
+        currentAccount.totalTradedVolume += signal.volume;
+      }
+      
       // ОПТИМИЗАЦИЯ: Убрали логирование для скорости
       
       // НЕ очищаем сигнал после открытия позиции - он нужен для логики закрытия!
@@ -691,7 +813,7 @@ async function openPosition(signal: any) {
  * Асинхронная проверка комиссии после закрытия позиции
  * Не блокирует торговлю - выполняется в фоне
  */
-async function checkCommissionAfterClose(orderId: number): Promise<void> {
+async function checkCommissionAfterClose(orderId: number, apiKeyClientForCheck: ApiKeyClient, accountIdForCheck: string): Promise<void> {
   // КРИТИЧЕСКИ ВАЖНО: Не проверяем комиссию во время тестирования аккаунта
   // Это может привести к использованию неправильного apiKeyClient
   if (isTestingAccount) {
@@ -699,78 +821,151 @@ async function checkCommissionAfterClose(orderId: number): Promise<void> {
     return;
   }
   
-  if (!apiKeyClient) {
-    console.log(`[COMMISSION] API Key клиент не настроен, пропускаем проверку комиссии`);
+  // КРИТИЧЕСКИ ВАЖНО: Не проверяем комиссию, если идет переключение аккаунта
+  // Это может привести к использованию неправильного apiKeyClient или проверке комиссии для неправильного аккаунта
+  if (isSwitchingAccount) {
+    console.log(`[COMMISSION] ⚠️ Идет переключение аккаунта, пропускаем проверку комиссии`);
+    return;
+  }
+  
+  // КРИТИЧЕСКИ ВАЖНО: Не проверяем комиссию сразу после переключения на новый аккаунт
+  // Это предотвращает проверку комиссии в последних сделках нового аккаунта (от предыдущих сессий)
+  // и повторное переключение сразу после переключения на новый аккаунт
+  if (lastAccountSwitchTime > 0 && Date.now() - lastAccountSwitchTime < ACCOUNT_SWITCH_COOLDOWN) {
+    console.log(`[COMMISSION] ⚠️ Недавно переключились на аккаунт (${Math.round((Date.now() - lastAccountSwitchTime) / 1000)} сек назад), пропускаем проверку комиссии`);
+    return;
+  }
+  
+  // КРИТИЧЕСКИ ВАЖНО: Проверяем, что текущий аккаунт соответствует аккаунту, для которого мы проверяем комиссию
+  // Если аккаунт переключился, не проверяем комиссию (она может быть для предыдущего аккаунта)
+  if (currentAccount?.id !== accountIdForCheck) {
+    console.log(`[COMMISSION] ⚠️ Аккаунт переключился перед проверкой комиссии (был: ${accountIdForCheck}, стал: ${currentAccount?.id}). Пропускаем проверку.`);
     return;
   }
 
   try {
-    console.log(`[COMMISSION] Проверяем комиссию для ордера ${orderId}...`);
+    console.log(`[COMMISSION] Проверяем комиссию в последних 2 сделках для аккаунта ${accountIdForCheck}...`);
     
-    // Получаем детали ордера через API Key
-    const orderDetails = await apiKeyClient.getOrderDetails(orderId, SYMBOL);
+    // КРИТИЧЕСКИ ВАЖНО: Получаем последние 2 сделки (states=3 = выполненные)
+    // Используем переданный apiKeyClientForCheck, а не глобальный apiKeyClient
+    const historyResponse = await apiKeyClientForCheck.getOrderHistory(SYMBOL, 2, 3);
     
-    // Ищем поле комиссии в ответе (может быть fee, commission, или в другом формате)
-    let commission = 0;
-    if (orderDetails && orderDetails.data) {
-      const order = Array.isArray(orderDetails.data) ? orderDetails.data[0] : orderDetails.data;
-      commission = parseFloat(String(order.fee || order.commission || order.feeAmount || 0));
+    // Проверяем структуру ответа MEXC
+    // MEXC может возвращать: { success: true, code: 0, data: {...} }
+    // или просто данные напрямую
+    let historyData = historyResponse;
+    if (historyResponse && typeof historyResponse === 'object' && 'data' in historyResponse && historyResponse.success === true) {
+      historyData = historyResponse.data;
+    }
+    
+    // Извлекаем список ордеров из ответа
+    let orders: any[] = [];
+    if (historyData) {
+      if (Array.isArray(historyData)) {
+        orders = historyData;
+      } else if (historyData.data && Array.isArray(historyData.data)) {
+        orders = historyData.data;
+      } else if (historyData.list && Array.isArray(historyData.list)) {
+        orders = historyData.list;
+      } else if (historyData.orders && Array.isArray(historyData.orders)) {
+        orders = historyData.orders;
+      }
+    }
+    
+    console.log(`[COMMISSION] Получено ${orders.length} последних сделок для проверки комиссии`);
+    
+    // Если не получили сделки, логируем предупреждение, но не останавливаем торговлю
+    if (orders.length === 0) {
+      console.log(`[COMMISSION] ⚠️ Не удалось получить последние сделки для проверки комиссии. Продолжаем торговлю.`);
+      return;
+    }
+    
+    // КРИТИЧЕСКИ ВАЖНО: Проверяем, что аккаунт не изменился во время проверки комиссии
+    // Если аккаунт переключился, не проверяем комиссию (она может быть для предыдущего аккаунта)
+    // ВАЖНО: Проверяем ДО получения истории сделок, чтобы не тратить время на запрос для неправильного аккаунта
+    if (currentAccount?.id !== accountIdForCheck) {
+      console.log(`[COMMISSION] ⚠️ Аккаунт переключился во время проверки комиссии (был: ${accountIdForCheck}, стал: ${currentAccount?.id}). Пропускаем проверку.`);
+      return;
+    }
+    
+    
+    // Проверяем комиссию в каждой из последних 2 сделок
+    let foundCommission = false;
+    let totalCommission = 0;
+    let commissionOrders: any[] = [];
+    
+    for (const order of orders) {
+      // Ищем поле комиссии в ответе (может быть fee, commission, feeAmount, totalFee и т.д.)
+      // ВАЖНО: НЕ проверяем zeroSaveTotalFeeBinance и zeroTradeTotalFeeBinance - это не показатели реальной комиссии
+      // MEXC может возвращать комиссию в разных полях, проверяем только реальные поля комиссии
+      const commission = parseFloat(String(
+        order.fee || 
+        order.commission || 
+        order.feeAmount || 
+        order.totalFee || 
+        order.feeDeduct || 
+        (order.deductFeeList && Array.isArray(order.deductFeeList) && order.deductFeeList.length > 0 
+          ? order.deductFeeList.reduce((sum: number, f: any) => sum + parseFloat(String(f.fee || f.amount || 0)), 0) 
+          : 0) ||
+        0
+      ));
+      
+      const orderId = order.orderId || order.id || order.order_id || 'unknown';
+      
+      // Логируем детали для отладки (только для первых 2 сделок, чтобы не засорять логи)
+      if (orders.indexOf(order) < 2) {
+        console.log(`[COMMISSION] Проверка ордера ${orderId}: fee=${order.fee || 0}, commission=${order.commission || 0}, totalFee=${order.totalFee || 0}, вычисленная комиссия=${commission}`);
+      }
+      
+      if (commission > 0) {
+        foundCommission = true;
+        totalCommission += commission;
+        commissionOrders.push({
+          orderId: orderId,
+          commission: commission
+        });
+        console.log(`[COMMISSION] ⚠️ Обнаружена комиссия ${commission} USDT в ордере ${orderId}`);
+      }
     }
 
-    if (commission > 0) {
-      console.log(`[COMMISSION] ⚠️ ОБНАРУЖЕНА КОМИССИЯ: ${commission} USDT для ордера ${orderId}`);
-      console.log(`[COMMISSION] 🛑 Останавливаем торговлю на текущем аккаунте из-за комиссии`);
+    if (foundCommission) {
+      // КРИТИЧЕСКИ ВАЖНО: Еще раз проверяем, что аккаунт не изменился
+      // Если аккаунт переключился, не останавливаем торговлю (комиссия была для предыдущего аккаунта)
+      if (currentAccount?.id !== accountIdForCheck) {
+        console.log(`[COMMISSION] ⚠️ Аккаунт переключился после обнаружения комиссии (был: ${accountIdForCheck}, стал: ${currentAccount?.id}). Не останавливаем торговлю.`);
+        return;
+      }
       
-      // Снимаем блокировку открытия позиций (бот все равно остановится или переключится)
-      isWaitingForBalanceAndCommission = false;
+      console.log(`[COMMISSION] ⚠️ ОБНАРУЖЕНА КОМИССИЯ: общая сумма ${totalCommission} USDT в ${commissionOrders.length} из ${orders.length} последних сделок`);
       
-      // МУЛЬТИАККАУНТИНГ: Если включен, переключаемся на следующий аккаунт
-      // ВАЖНО: Переключаемся ДО установки isRunning = false, чтобы переключение произошло
-      if (multiAccountConfig.enabled && currentAccount) {
-        console.log(`[MULTI-ACCOUNT] 🔄 Обнаружена комиссия, останавливаем торговлю на текущем аккаунте и переключаемся на следующий`);
-        
-        // КРИТИЧЕСКИ ВАЖНО: Останавливаем торговлю на текущем аккаунте перед переключением
-        // Это гарантирует, что статус аккаунта обновится и все открытые позиции будут проверены
-        try {
-          await stopTradingOnCurrentAccount('Обнаружена комиссия');
-        } catch (stopError) {
-          console.error('[MULTI-ACCOUNT] Ошибка остановки текущего аккаунта при обнаружении комиссии:', stopError);
-        }
-        
-        // Теперь переключаемся на следующий аккаунт
-        // switchToNextAccount проверит открытые позиции и переключится на следующий аккаунт
-        switchToNextAccount('Обнаружена комиссия').catch(error => {
-          console.error('[MULTI-ACCOUNT] Ошибка переключения после обнаружения комиссии:', error);
-          // Если переключение не удалось, останавливаем бота
-          if (isRunning) {
-            isRunning = false;
-            if (binanceWS) {
-              binanceWS.onPriceUpdate = undefined;
-              binanceWS.onError = undefined;
-              binanceWS.onConnect = undefined;
-              binanceWS.onDisconnect = undefined;
-              binanceWS.disconnect();
+      // МУЛЬТИАККАУНТИНГ: Если включен, используем ту же логику, что и для лимита по времени
+      // Просто переключаемся на следующий аккаунт, не останавливая весь бот
+      if (multiAccountConfig.enabled && currentAccount && currentAccount.id === accountIdForCheck) {
+        // КРИТИЧЕСКИ ВАЖНО: Если позиция открыта, устанавливаем флаг для переключения после закрытия
+        // И ВАЖНО: принудительно закрываем позицию по текущему спреду
+        if (currentPosition) {
+          if (!pendingAccountSwitch) {
+            pendingAccountSwitch = { reason: 'Обнаружена комиссия' };
+            console.log(`[COMMISSION] ⚠️ Обнаружена комиссия, позиция открыта. Закрываем позицию принудительно, затем переключимся на следующий аккаунт`);
+            
+            // КРИТИЧЕСКИ ВАЖНО: Принудительно закрываем позицию по текущему спреду
+            if (currentSpread) {
+              closePosition(currentSpread).catch(error => {
+                console.error('[COMMISSION] Ошибка принудительного закрытия позиции при комиссии:', error);
+              });
+            } else {
+              console.warn('[COMMISSION] ⚠️ Нет данных спреда для закрытия позиции');
             }
-            if (mexcWS) {
-              mexcWS.onPriceUpdate = undefined;
-              mexcWS.onOrderbookUpdate = undefined;
-              mexcWS.onError = undefined;
-              mexcWS.onConnect = undefined;
-              mexcWS.onDisconnect = undefined;
-              mexcWS.disconnect();
-            }
-            if (priceMonitor) {
-              priceMonitor.onSpreadUpdate = undefined;
-            }
-            if (arbitrageStrategy) {
-              arbitrageStrategy.onSignal = undefined;
-              arbitrageStrategy.clearSignal();
-            }
-            currentPosition = null;
-            console.log(`[COMMISSION] 🛑 Бот остановлен из-за обнаруженной комиссии (переключение не удалось)`);
           }
-        });
-        // Не устанавливаем isRunning = false здесь, так как switchToNextAccount может продолжить торговлю на следующем аккаунте
+        } else {
+          // Если позиция закрыта, переключаемся сразу (как при достижении лимита по времени)
+          console.log(`[COMMISSION] 🛑 Обнаружена комиссия, переключаемся на следующий аккаунт`);
+          // Просто переключаемся на следующий аккаунт (как при достижении лимита по времени)
+          // switchToNextAccount сам остановит торговлю на текущем аккаунте и переключится на следующий
+          switchToNextAccount('Обнаружена комиссия').catch(error => {
+            console.error('[MULTI-ACCOUNT] Ошибка переключения после обнаружения комиссии:', error);
+          });
+        }
         return; // Выходим из функции, не останавливая бота
       }
       
@@ -812,11 +1007,17 @@ async function checkCommissionAfterClose(orderId: number): Promise<void> {
       
       // Можно также отправить уведомление в UI через WebSocket или другой механизм
     } else {
-      console.log(`[COMMISSION] ✓ Комиссия не обнаружена для ордера ${orderId}`);
+      console.log(`[COMMISSION] ✓ Комиссия не обнаружена в последних ${orders.length} сделках (комиссия = 0% во всех)`);
     }
   } catch (error: any) {
-    console.error(`[COMMISSION] Ошибка при проверке комиссии:`, error.message);
-    // Не останавливаем бота при ошибке - возможно API недоступен
+    console.error(`[COMMISSION] ❌ Ошибка при проверке комиссии:`, error.message);
+    if (error.response) {
+      console.error(`[COMMISSION] API ответ:`, error.response.status, error.response.data);
+    }
+    // КРИТИЧЕСКИ ВАЖНО: Не останавливаем бота при ошибке API
+    // Это может быть временная проблема с API, и мы не хотим останавливать торговлю из-за этого
+    // Но логируем ошибку для диагностики
+    console.log(`[COMMISSION] ⚠️ Продолжаем торговлю, так как ошибка проверки комиссии может быть временной`);
   }
 }
 
@@ -831,6 +1032,10 @@ async function closePosition(spreadData: any) {
   
   // Устанавливаем флаг ВНУТРИ функции, чтобы избежать race condition
   isClosing = true;
+  
+  // КРИТИЧЕСКИ ВАЖНО: Устанавливаем блокировку открытия новых позиций СРАЗУ в начале закрытия
+  // Это предотвращает открытие новых позиций во время закрытия и проверки комиссии
+  isWaitingForBalanceAndCommission = true;
   
   try {
     if (!currentPosition) {
@@ -893,11 +1098,13 @@ async function closePosition(spreadData: any) {
     // ОПТИМИЗАЦИЯ: Используем кэш контракта вместо запроса к API
     let priceScale = 3;
     let volScale = 0;
+    let contractSize = 1;
     
     if (contractCache && contractCache.symbol === SYMBOL && Date.now() - contractCache.timestamp < CONTRACT_CACHE_TTL) {
       const contract = contractCache.data;
       priceScale = contract?.priceScale || 3;
       volScale = contract?.volScale || 0;
+      contractSize = parseFloat(String(contract?.contractSize || 1));
     } else {
       // Если кэш устарел, получаем контракт (но это редко)
       const contractDetail = await tradingHandler.getContractDetail(SYMBOL);
@@ -907,6 +1114,7 @@ async function closePosition(spreadData: any) {
           : contractDetail.data;
         priceScale = contract?.priceScale || 3;
         volScale = contract?.volScale || 0;
+        contractSize = parseFloat(String(contract?.contractSize || 1));
         contractCache = { symbol: SYMBOL, data: contract, timestamp: Date.now() };
       }
     }
@@ -922,6 +1130,7 @@ async function closePosition(spreadData: any) {
     const roundedPrice = parseFloat(exitPrice.toFixed(priceScale));
     
     // Используем реальный объем позиции из API
+    // positionVolume - это объем в контрактах
     const roundedVolume = parseFloat(positionVolume.toFixed(volScale));
 
     // Используем тот же формат, что и кнопка "Закрыть"
@@ -979,17 +1188,22 @@ async function closePosition(spreadData: any) {
         orderId = orderData.orderId || orderData.id || null;
       }
       
+      // КРИТИЧЕСКИ ВАЖНО: Сохраняем данные позиции ДО обнуления currentPosition
+      const closedPositionVolume = currentPosition?.volume || 0; // Объем открытия в USDT
+      const closedPositionPrice = roundedPrice; // Цена закрытия
+      const closedPositionContractSize = contractSize; // contractSize для расчета объема закрытия
+      
+      // КРИТИЧЕСКИ ВАЖНО: Устанавливаем флаг блокировки открытия новых позиций
+      // ДО обнуления currentPosition, чтобы гарантировать блокировку до завершения проверки комиссии
+      isWaitingForBalanceAndCommission = true;
+      console.log(`[TRADE] ⏳ Блокируем открытие новых позиций до обновления баланса и проверки комиссии`);
+      
       // ОПТИМИЗАЦИЯ: Логируем только критичные события для скорости
       currentPosition = null;
       isClosing = false; // Сбрасываем флаг после успешного закрытия
       if (arbitrageStrategy) {
         arbitrageStrategy.clearSignal();
       }
-      
-      // КРИТИЧЕСКИ ВАЖНО: Устанавливаем флаг блокировки открытия новых позиций
-      // до обновления баланса и проверки комиссии
-      isWaitingForBalanceAndCommission = true;
-      console.log(`[TRADE] ⏳ Блокируем открытие новых позиций до обновления баланса и проверки комиссии`);
       
       // Устанавливаем флаг для обновления истории сделок на клиенте
       lastTradeCloseTime = Date.now();
@@ -1014,33 +1228,57 @@ async function closePosition(spreadData: any) {
       });
       
       // АСИНХРОННАЯ проверка комиссии (не блокирует торговлю)
-      const commissionCheckPromise = orderId && apiKeyClient
-        ? checkCommissionAfterClose(orderId).catch((error) => {
+      // КРИТИЧЕСКИ ВАЖНО: Сохраняем apiKeyClient и currentAccount.id ДО создания Promise
+      // Это гарантирует, что проверка комиссии будет выполнена для правильного аккаунта
+      // даже если аккаунт переключится во время проверки
+      const apiKeyClientForCommission = apiKeyClient;
+      const accountIdForCommission = currentAccount?.id;
+      const commissionCheckPromise = orderId && apiKeyClientForCommission && accountIdForCommission
+        ? checkCommissionAfterClose(orderId, apiKeyClientForCommission, accountIdForCommission).catch((error) => {
             console.error(`[COMMISSION] Ошибка проверки комиссии:`, error);
             // Не останавливаем бота при ошибке проверки комиссии
           })
         : Promise.resolve();
       
-      // МУЛЬТИАККАУНТИНГ: Увеличиваем счетчик сделок
+      // МУЛЬТИАККАУНТИНГ: Увеличиваем счетчик сделок и обновляем проторгованный объем
       if (multiAccountConfig.enabled && currentAccount) {
         currentAccount.tradesCount++;
+        // Обновляем проторгованный объем: добавляем объем закрытия
+        // Объем открытия уже был добавлен при открытии позиции (signal.volume в USDT)
+        // Объем закрытия = объем позиции в контрактах * цена закрытия * contractSize
+        // roundedVolume - это объем в контрактах, closedPositionPrice - цена закрытия
+        // ВАЖНО: roundedVolume в контрактах, умножаем на цену и contractSize для получения объема в USDT
+        const closeVolumeInUsdt = roundedVolume * closedPositionPrice * closedPositionContractSize; // Объем закрытия в USDT
+        if (!currentAccount.totalTradedVolume) {
+          currentAccount.totalTradedVolume = 0;
+        }
+        // Добавляем объем закрытия (объем открытия уже был добавлен при открытии позиции)
+        // Итого: объем открытия + объем закрытия = общий проторгованный объем
+        currentAccount.totalTradedVolume += closeVolumeInUsdt;
+        console.log(`[MULTI-ACCOUNT] 📊 Обновлен проторгованный объем: +${closeVolumeInUsdt.toFixed(2)} USDT (закрытие), всего: ${currentAccount.totalTradedVolume.toFixed(2)} USDT`);
       }
       
       // Ждем завершения обновления баланса и проверки комиссии, затем снимаем блокировку
       Promise.all([balanceUpdatePromise, commissionCheckPromise]).then(() => {
         // ВАЖНО: Проверяем, что бот все еще запущен перед снятием блокировки
         // Если бот остановлен (например, при переключении аккаунтов), не снимаем блокировку
-        if (isRunning) {
+        // НО: если идет переключение аккаунта (isSwitchingAccount = true), блокировку снимать не нужно
+        // она будет снята после успешного переключения в switchToNextAccount
+        if (isRunning && !isSwitchingAccount) {
           // Снимаем блокировку сразу после получения данных
           isWaitingForBalanceAndCommission = false;
           console.log(`[TRADE] ✅ Баланс обновлен и комиссия проверена, разрешаем открытие новых позиций`);
+        } else if (isSwitchingAccount) {
+          console.log(`[TRADE] ⏳ Идет переключение аккаунта, блокировка будет снята после переключения`);
         } else {
           console.log(`[TRADE] ⚠️ Бот остановлен во время обновления баланса/комиссии, блокировка не снимается`);
         }
         
         // КРИТИЧЕСКИ ВАЖНО: Проверяем условия переключения ПОСЛЕ обновления баланса
         // Это гарантирует, что баланс уже обновлен перед проверкой условий
-        if (multiAccountConfig.enabled && currentAccount && isRunning) {
+        // ВАЖНО: Не проверяем условия, если идет переключение аккаунта (isSwitchingAccount = true)
+        // Это предотвращает повторное переключение сразу после переключения на новый аккаунт
+        if (multiAccountConfig.enabled && currentAccount && isRunning && !isSwitchingAccount) {
           // КРИТИЧЕСКИ ВАЖНО: Если был установлен флаг переключения (время истекло), переключаемся сразу после закрытия
           if (pendingAccountSwitch) {
             const switchReason = pendingAccountSwitch.reason;
@@ -1062,6 +1300,7 @@ async function closePosition(spreadData: any) {
           
           // ВАЖНО: Проверяем условия переключения после обновления баланса
           // Баланс уже обновлен в balanceUpdatePromise выше, поэтому просто проверяем условия
+          console.log(`[MULTI-ACCOUNT] 🔍 Вызываем checkAccountSwitchConditions после обновления баланса (баланс: ${balanceCache?.balance?.toFixed(8) || 'неизвестно'} USDT)`);
           checkAccountSwitchConditions().catch(error => {
             console.error('[MULTI-ACCOUNT] Ошибка проверки условий переключения:', error);
           });
@@ -1385,6 +1624,69 @@ app.get('/api/status', (req, res) => {
   });
 });
 
+// Диагностика состояния бота (для отладки)
+app.get('/api/debug/state', (req, res) => {
+  const now = Date.now();
+  
+  // Определяем причины, почему не может торговать
+  const reasons: string[] = [];
+  if (!isRunning) reasons.push('Бот не запущен (isRunning = false)');
+  if (isSwitchingAccount) reasons.push('Идет переключение аккаунта');
+  if (isTestingAccount) reasons.push('Идет тестирование аккаунта');
+  if (isWaitingForBalanceAndCommission) reasons.push('Ожидание обновления баланса и проверки комиссии');
+  if (rateLimitBlockedUntil > now) reasons.push(`Rate limiting заблокирован еще ${Math.ceil((rateLimitBlockedUntil - now) / 1000)} сек`);
+  
+  res.json({
+    flags: {
+      isRunning: isRunning,
+      isSwitchingAccount: isSwitchingAccount,
+      isTestingAccount: isTestingAccount,
+      isWaitingForBalanceAndCommission: isWaitingForBalanceAndCommission,
+      rateLimitBlockedUntil: rateLimitBlockedUntil,
+      rateLimitBlocked: rateLimitBlockedUntil > now,
+      rateLimitRemainingSeconds: rateLimitBlockedUntil > now ? Math.ceil((rateLimitBlockedUntil - now) / 1000) : 0
+    },
+    connections: {
+      binanceConnected: binanceWS?.getConnectionStatus() || false,
+      mexcConnected: mexcWS?.getConnectionStatus() || false
+    },
+    trading: {
+      currentPosition: currentPosition,
+      currentSpread: currentSpread ? {
+        spread: currentSpread.spread?.tickDifference,
+        mexcPrice: currentSpread.mexc?.price,
+        binancePrice: currentSpread.binance?.price
+      } : null,
+      arbitrageVolume: arbitrageVolume,
+      autoVolumeEnabled: autoVolumeEnabled,
+      autoLeverage: autoLeverage
+    },
+    multiAccount: {
+      enabled: multiAccountConfig.enabled,
+      currentAccount: currentAccount ? {
+        id: currentAccount.id,
+        name: currentAccount.name,
+        status: currentAccount.status
+      } : null,
+      totalAccounts: multiAccountConfig.accounts.length
+    },
+    balance: {
+      cached: balanceCache ? {
+        balance: balanceCache.balance,
+        volume: balanceCache.volume
+      } : null
+    },
+    canTrade: {
+      canOpenPosition: isRunning && 
+                       !isSwitchingAccount && 
+                       !isTestingAccount && 
+                       !isWaitingForBalanceAndCommission && 
+                       rateLimitBlockedUntil <= now,
+      reasons: reasons
+    }
+  });
+});
+
 app.get('/api/spread', (req, res) => {
   const spread = priceMonitor?.getCurrentSpread();
   res.json({ success: true, data: spread });
@@ -1679,6 +1981,28 @@ async function calculateAutoVolume(): Promise<number> {
     }
   }
 
+  // Проверка минимального баланса для торговли
+  if (availableBalance < minBalanceForTrading) {
+    console.warn(`[AUTO-VOLUME] ⚠️ Баланс (${availableBalance.toFixed(8)} USDT) меньше минимального для торговли (${minBalanceForTrading} USDT). Объем = 0`);
+    if (balanceCache) {
+      balanceCache.volume = 0;
+    }
+    
+    // МУЛЬТИАККАУНТИНГ: Если включен и позиция закрыта, проверяем условия переключения сразу
+    // ВАЖНО: Если баланс недостаточен, бот не может торговать (объем = 0),
+    // поэтому переключаемся сразу, без задержки 5 секунд
+    if (multiAccountConfig.enabled && currentAccount && isRunning && !isSwitchingAccount && !isTestingAccount && !currentPosition) {
+      console.log(`[AUTO-VOLUME] Баланс недостаточен, проверяем условия переключения аккаунта (без задержки)...`);
+      // Вызываем асинхронно, не блокируя расчет объема
+      // В checkAccountSwitchConditions будет проверка баланса, которая переключит аккаунт
+      checkAccountSwitchConditions().catch(error => {
+        console.error('[AUTO-VOLUME] Ошибка проверки условий переключения:', error);
+      });
+    }
+    
+    return 0;
+  }
+  
   // Рассчитываем максимально возможный объем с учетом плеча
   // Примечание: для кросс-маржи и изолированной маржи расчет одинаковый,
   // так как аккаунт торгуется только через этого бота и других позиций нет
@@ -1695,10 +2019,20 @@ async function calculateAutoVolume(): Promise<number> {
   // Округляем до 2 знаков после запятой
   calculatedVolume = Math.floor(calculatedVolume * 100) / 100;
   
+  // Если после округления объем стал 0, но баланс достаточен, используем минимальный объем
+  if (calculatedVolume === 0 && availableBalance >= minBalanceForTrading) {
+    // Используем минимальный объем 0.01 USDT (или 1% от баланса, если меньше)
+    calculatedVolume = Math.max(0.01, availableBalance * 0.01);
+    calculatedVolume = Math.floor(calculatedVolume * 100) / 100;
+    console.warn(`[AUTO-VOLUME] ⚠️ После округления объем стал 0, используем минимальный объем: ${calculatedVolume} USDT`);
+  }
+  
   // Обновляем объем в кэше
   if (balanceCache) {
     balanceCache.volume = calculatedVolume;
   }
+  
+  console.log(`[AUTO-VOLUME] Баланс: ${availableBalance.toFixed(8)} USDT, Плечо: ${autoLeverage}x, Объем: ${calculatedVolume.toFixed(2)} USDT`);
   
   return calculatedVolume;
 }
@@ -2089,6 +2423,13 @@ app.post('/api/server/restart', async (req, res) => {
     isClosing = false;
     lastTradeCloseTime = 0;
     
+    // КРИТИЧЕСКИ ВАЖНО: Сбрасываем флаги мультиаккаунтинга
+    isSwitchingAccount = false;
+    isWaitingForBalanceAndCommission = false;
+    pendingAccountSwitch = null;
+    isTestingAccount = false;
+    rateLimitBlockedUntil = 0;
+    
     console.log('[SERVER] ✓ Все компоненты остановлены и очищены');
     console.log('[SERVER] Сервер готов к новым подключениям. Для запуска бота используйте /api/arbitrage/start');
     
@@ -2414,6 +2755,40 @@ async function getAccountBalance(): Promise<number> {
 }
 
 /**
+ * Форматирование объема для отображения (например, "143k$")
+ */
+function formatVolume(volume: number | undefined): string {
+  if (!volume || volume === 0) return '0$';
+  if (volume >= 1000000) {
+    return `${(volume / 1000000).toFixed(1)}M$`;
+  } else if (volume >= 1000) {
+    return `${(volume / 1000).toFixed(0)}k$`;
+  } else {
+    return `${volume.toFixed(2)}$`;
+  }
+}
+
+/**
+ * Форматирование времени работы аккаунта
+ */
+function formatTradingTime(startTime: number | undefined): string {
+  if (!startTime) return '0м';
+  const now = Date.now();
+  const diff = now - startTime;
+  const minutes = Math.floor(diff / 60000);
+  const hours = Math.floor(minutes / 60);
+  const days = Math.floor(hours / 24);
+  
+  if (days > 0) {
+    return `${days}д ${hours % 24}ч`;
+  } else if (hours > 0) {
+    return `${hours}ч ${minutes % 60}м`;
+  } else {
+    return `${minutes}м`;
+  }
+}
+
+/**
  * Остановка торговли на текущем аккаунте
  */
 async function stopTradingOnCurrentAccount(reason: string): Promise<void> {
@@ -2441,7 +2816,11 @@ async function stopTradingOnCurrentAccount(reason: string): Promise<void> {
   }
   
   // Обновляем статус аккаунта
-  currentAccount.status = 'stopped';
+  // ВАЖНО: Если статус уже 'error', не меняем его на 'stopped'
+  // Это позволяет сохранить причину ошибки
+  if (currentAccount.status !== 'error') {
+    currentAccount.status = 'stopped';
+  }
   currentAccount.stopReason = reason;
   currentAccount.lastUpdateTime = Date.now();
   
@@ -2451,28 +2830,96 @@ async function stopTradingOnCurrentAccount(reason: string): Promise<void> {
     reason
   });
   
-  // Останавливаем торговлю (если запущена)
-  if (isRunning) {
-    // Останавливаем WebSocket соединения (но не удаляем их - они общие)
-    if (binanceWS) {
-      binanceWS.onPriceUpdate = undefined;
-    }
-    if (mexcWS) {
-      mexcWS.onPriceUpdate = undefined;
-      mexcWS.onOrderbookUpdate = undefined;
-    }
-    if (priceMonitor) {
-      priceMonitor.onSpreadUpdate = undefined;
-    }
-    if (arbitrageStrategy) {
-      arbitrageStrategy.onSignal = undefined;
-      arbitrageStrategy.clearSignal();
+  // Формируем отчет о проработанном аккаунте (асинхронно, чтобы не мешать работе)
+  // КРИТИЧЕСКИ ВАЖНО: Проверяем, не был ли уже создан отчет для этого аккаунта
+  // Это предотвращает дублирование отчетов при повторных вызовах stopTradingOnCurrentAccount
+  try {
+    // Проверяем, есть ли уже отчет для этого аккаунта
+    if (!currentAccount) {
+      return; // Аккаунт уже не существует, не создаем отчет
     }
     
-    // Очищаем текущую позицию
-    currentPosition = null;
-    isRunning = false;
+    const accountName = currentAccount.name || currentAccount.id;
+    const accountApiKey = currentAccount.apiKey;
+    const accountApiSecret = currentAccount.apiSecret;
+    
+    const existingReport = accountReports.find(r => 
+      r.accountName === accountName &&
+      r.apiKey === accountApiKey &&
+      r.apiSecret === accountApiSecret
+    );
+    
+    if (existingReport) {
+      console.log(`[REPORTS] ⚠️ Отчет для аккаунта "${accountName}" уже существует, пропускаем создание дубликата`);
+      return; // Не создаем дубликат
+    }
+    
+    const endTime = Date.now();
+    const startTime = currentAccount.startTime || endTime;
+    const tradingTimeMinutes = (endTime - startTime) / 60000;
+    const initialBalance = currentAccount.initialBalance || 0;
+    const finalBalanceValue = finalBalance || 0;
+    const profit = finalBalanceValue - initialBalance;
+    
+    const report: AccountReport = {
+      id: `${currentAccount.id}_${endTime}`,
+      timestamp: endTime,
+      accountName: currentAccount.name || currentAccount.id,
+      apiKey: currentAccount.apiKey,
+      apiSecret: currentAccount.apiSecret,
+      webToken: currentAccount.webToken,
+      startTime: startTime,
+      endTime: endTime,
+      tradingTimeMinutes: Math.round(tradingTimeMinutes * 100) / 100,
+      initialBalance: initialBalance,
+      finalBalance: finalBalanceValue,
+      profit: Math.round(profit * 100) / 100,
+      tradesCount: currentAccount.tradesCount || 0,
+      totalTradedVolume: currentAccount.totalTradedVolume || 0,
+      stopReason: reason
+    };
+    
+    // Добавляем отчет в массив (в конец списка)
+    accountReports.push(report);
+    console.log(`[REPORTS] ✅ Отчет добавлен для аккаунта "${currentAccount.name || currentAccount.id}"`);
+    
+    // Асинхронно сохраняем отчеты в файл (не блокируем основной поток)
+    saveReportsToFile().catch(err => {
+      console.error('[REPORTS] Ошибка асинхронного сохранения отчета:', err);
+    });
+  } catch (reportError) {
+    // Ошибка формирования отчета не должна мешать работе бота
+    console.error('[REPORTS] Ошибка формирования отчета:', reportError);
   }
+  
+  // КРИТИЧЕСКИ ВАЖНО: НЕ останавливаем весь бот (isRunning) при переключении аккаунтов!
+  // Мы только останавливаем торговлю на текущем аккаунте, но бот должен продолжать работать
+  // и переключиться на следующий аккаунт. isRunning будет установлен в true в switchToAccount
+  // после успешного переключения на новый аккаунт.
+  
+  // Останавливаем обработчики только для текущего аккаунта (но не останавливаем весь бот)
+  // Обработчики будут восстановлены в switchToAccount после переключения
+  if (binanceWS) {
+    binanceWS.onPriceUpdate = undefined;
+  }
+  if (mexcWS) {
+    mexcWS.onPriceUpdate = undefined;
+    mexcWS.onOrderbookUpdate = undefined;
+  }
+  if (priceMonitor) {
+    priceMonitor.onSpreadUpdate = undefined;
+  }
+  if (arbitrageStrategy) {
+    arbitrageStrategy.onSignal = undefined;
+    arbitrageStrategy.clearSignal();
+  }
+  
+  // Очищаем текущую позицию
+  currentPosition = null;
+  
+  // КРИТИЧЕСКИ ВАЖНО: НЕ устанавливаем isRunning = false здесь!
+  // Это останавливает весь бот, а не только торговлю на текущем аккаунте.
+  // isRunning должен остаться true, чтобы бот мог переключиться на следующий аккаунт.
 }
 
 /**
@@ -2481,6 +2928,11 @@ async function stopTradingOnCurrentAccount(reason: string): Promise<void> {
 async function switchToAccount(accountId: string, reason: string = 'switch'): Promise<boolean> {
   // КРИТИЧЕСКИ ВАЖНО: Устанавливаем флаг блокировки открытия позиций
   isSwitchingAccount = true;
+  
+  // КРИТИЧЕСКИ ВАЖНО: Устанавливаем время переключения СРАЗУ, чтобы предотвратить проверку комиссии
+  // в Promise, который может быть выполнен параллельно
+  lastAccountSwitchTime = Date.now();
+  console.log(`[MULTI-ACCOUNT] ⏰ Время переключения установлено в начале switchToAccount: ${new Date(lastAccountSwitchTime).toISOString()}`);
   
   try {
     const wasRunning = isRunning; // Сохраняем состояние торговли
@@ -2574,6 +3026,7 @@ async function switchToAccount(accountId: string, reason: string = 'switch'): Pr
     account.startTime = Date.now(); // ВАЖНО: Обновляем время старта для нового аккаунта
     account.status = 'trading';
     account.tradesCount = 0;
+    account.totalTradedVolume = 0; // Сбрасываем проторгованный объем
     account.stopReason = undefined;
     account.lastUpdateTime = Date.now();
     
@@ -2582,6 +3035,32 @@ async function switchToAccount(accountId: string, reason: string = 'switch'): Pr
     
     // Обновляем кэш баланса
     balanceCache = { balance: initialBalance, volume: 0 };
+    
+    // МУЛЬТИАККАУНТИНГ: Проверяем баланс сразу после переключения
+    // Если баланс недостаточен, создаем отчет и переключаемся на следующий
+    if (initialBalance < minBalanceForTrading) {
+      console.warn(`[MULTI-ACCOUNT] ⚠️ Баланс аккаунта "${account.name || account.id}" (${initialBalance.toFixed(8)} USDT) меньше минимального для торговли (${minBalanceForTrading} USDT). Создаем отчет и переключаемся на следующий аккаунт.`);
+      
+      // КРИТИЧЕСКИ ВАЖНО: Устанавливаем currentAccount перед вызовом stopTradingOnCurrentAccount,
+      // чтобы отчет был создан правильно
+      currentAccount = account;
+      account.currentBalance = initialBalance;
+      account.startTime = Date.now(); // Устанавливаем время старта для правильного расчета времени торговли
+      
+      // Создаем отчет через stopTradingOnCurrentAccount
+      const stopReason = `Недостаточный баланс (< ${minBalanceForTrading} USDT)`;
+      await stopTradingOnCurrentAccount(stopReason);
+      
+      // Помечаем аккаунт как error после создания отчета
+      account.status = 'error';
+      account.stopReason = stopReason;
+      
+      // Снимаем флаг переключения, чтобы switchToNextAccount мог работать
+      isSwitchingAccount = false;
+      // Вызываем switchToNextAccount, который теперь не выберет этот аккаунт
+      const switchResult = await switchToNextAccount(stopReason);
+      return switchResult; // Возвращаем результат переключения
+    }
     
     // МУЛЬТИАККАУНТИНГ: Пересчитываем объем для нового аккаунта, если автообъем включен
     if (autoVolumeEnabled) {
@@ -2673,6 +3152,44 @@ async function switchToAccount(accountId: string, reason: string = 'switch'): Pr
           return;
         }
         
+        // КРИТИЧЕСКИ ВАЖНО: Блокируем открытие позиций во время переключения аккаунта
+        if (isSwitchingAccount) {
+          console.log(`[SIGNAL] Идет переключение аккаунта, игнорируем сигнал`);
+          if (arbitrageStrategy) {
+            arbitrageStrategy.clearSignal();
+          }
+          return;
+        }
+        
+        // КРИТИЧЕСКИ ВАЖНО: Блокируем открытие позиций во время тестирования аккаунта
+        if (isTestingAccount) {
+          console.log(`[SIGNAL] Идет тестирование аккаунта, игнорируем сигнал`);
+          if (arbitrageStrategy) {
+            arbitrageStrategy.clearSignal();
+          }
+          return;
+        }
+        
+        // КРИТИЧЕСКИ ВАЖНО: Блокируем открытие позиций до обновления баланса и проверки комиссии
+        if (isWaitingForBalanceAndCommission || isSwitchingAccount) {
+          const reason = isSwitchingAccount ? 'переключение аккаунта' : 'обновление баланса и проверка комиссии';
+          console.log(`[SIGNAL] ⏳ Ожидаем ${reason} после закрытия позиции, игнорируем сигнал`);
+          if (arbitrageStrategy) {
+            arbitrageStrategy.clearSignal();
+          }
+          return;
+        }
+        
+        // КРИТИЧЕСКИ ВАЖНО: Блокируем открытие позиций при ошибке "too frequent" (rate limiting)
+        if (rateLimitBlockedUntil > Date.now()) {
+          const remainingTime = Math.ceil((rateLimitBlockedUntil - Date.now()) / 1000);
+          console.log(`[SIGNAL] ⏳ Заблокировано из-за rate limiting, осталось ${remainingTime} сек. Игнорируем сигнал`);
+          if (arbitrageStrategy) {
+            arbitrageStrategy.clearSignal();
+          }
+          return;
+        }
+        
         // Если автообъем включен, рассчитываем объем при каждом сигнале
         if (autoVolumeEnabled) {
           try {
@@ -2682,11 +3199,29 @@ async function switchToAccount(accountId: string, reason: string = 'switch'): Pr
               arbitrageStrategy.updateConfig({ positionSize: arbitrageVolume });
             }
             signal.volume = arbitrageVolume;
+            
+            // Проверка: если объем равен 0, не открываем позицию
+            if (arbitrageVolume <= 0) {
+              console.warn(`[SIGNAL] ⚠️ Объем для торговли равен 0 (баланс: ${balanceCache?.balance?.toFixed(8) || 'неизвестно'} USDT). Игнорируем сигнал.`);
+              if (arbitrageStrategy) {
+                arbitrageStrategy.clearSignal();
+              }
+              return;
+            }
           } catch (error) {
             console.error('[SIGNAL] Error calculating auto volume:', error);
           }
         } else {
           signal.volume = arbitrageVolume;
+          
+          // Проверка: если объем равен 0, не открываем позицию
+          if (arbitrageVolume <= 0) {
+            console.warn(`[SIGNAL] ⚠️ Объем для торговли равен 0. Игнорируем сигнал.`);
+            if (arbitrageStrategy) {
+              arbitrageStrategy.clearSignal();
+            }
+            return;
+          }
         }
         
         try {
@@ -2694,39 +3229,7 @@ async function switchToAccount(accountId: string, reason: string = 'switch'): Pr
         } catch (error: any) {
           console.error(`[SIGNAL] Ошибка открытия позиции:`, error);
           
-          // КРИТИЧЕСКИ ВАЖНО: Если ошибка "Balance insufficient", обновляем баланс и пересчитываем объем
           const errorMessage = error.message || String(error) || '';
-          if (errorMessage.includes('Balance insufficient') || errorMessage.includes('Insufficient balance')) {
-            console.log(`[SIGNAL] ⚠️ Недостаточный баланс, обновляем баланс и пересчитываем объем...`);
-            
-            try {
-              // Обновляем баланс
-              await updateBalanceAfterTrade();
-              
-              // Пересчитываем автообъем, если включен
-              if (autoVolumeEnabled) {
-                const calculatedVolume = await calculateAutoVolume();
-                arbitrageVolume = calculatedVolume;
-                if (arbitrageStrategy) {
-                  arbitrageStrategy.updateConfig({ positionSize: arbitrageVolume });
-                }
-                console.log(`[SIGNAL] ✅ Баланс обновлен, объем пересчитан: ${arbitrageVolume.toFixed(2)} USDT`);
-              } else {
-                console.log(`[SIGNAL] ✅ Баланс обновлен (автообъем выключен)`);
-              }
-              
-              // Очищаем сигнал, чтобы можно было обработать новый с обновленными данными
-              if (arbitrageStrategy) {
-                arbitrageStrategy.clearSignal();
-              }
-              
-              // Не переключаемся на следующий аккаунт, просто игнорируем этот сигнал
-              return;
-            } catch (updateError: any) {
-              console.error(`[SIGNAL] Ошибка обновления баланса/объема:`, updateError);
-              // Если не удалось обновить, продолжаем обработку ошибки как обычно
-            }
-          }
           
           // Обработка ошибки "Requests are too frequent" - временная ошибка, не переключаемся на следующий аккаунт
           if (errorMessage.includes('Requests are too frequent') || errorMessage.includes('too frequent')) {
@@ -2746,19 +3249,141 @@ async function switchToAccount(accountId: string, reason: string = 'switch'): Pr
           // и приводят к переключению на следующий аккаунт
           if (multiAccountConfig.enabled) {
             // "too frequent" уже обработана выше, все остальные ошибки - критические
-            console.log(`[MULTI-ACCOUNT] Критичная ошибка открытия позиции, переключаемся на следующий аккаунт: ${errorMessage}`);
+            console.log(`[MULTI-ACCOUNT] Критичная ошибка открытия позиции, проверяем открытые позиции перед переключением: ${errorMessage}`);
             
-            // ВАЖНО: Помечаем текущий аккаунт как недоступный перед переключением
-            if (currentAccount) {
-              currentAccount.status = 'error';
-              currentAccount.stopReason = `Ошибка открытия позиции: ${error.message || errorMessage}`;
-              console.log(`[MULTI-ACCOUNT] ⚠️ Аккаунт "${currentAccount.name || currentAccount.id}" помечен как недоступный`);
+            // КРИТИЧЕСКИ ВАЖНО: Проверяем, есть ли открытая позиция на текущем аккаунте
+            let hasOpenPosition = false;
+            if (currentPosition) {
+              hasOpenPosition = true;
+              console.log(`[MULTI-ACCOUNT] ⚠️ Обнаружена открытая позиция, пытаемся закрыть перед переключением`);
+            } else {
+              // Дополнительная проверка: может быть позиция открыта на бирже, но currentPosition не установлен
+              try {
+                const positionsResult: any = await tradingHandler.getOpenPositions(SYMBOL);
+                if (positionsResult) {
+                  let positions: any[] = [];
+                  if (positionsResult.data) {
+                    const data: any = positionsResult.data;
+                    if (data && typeof data === 'object' && data.data && Array.isArray(data.data)) {
+                      positions = data.data;
+                    } else if (Array.isArray(data)) {
+                      positions = data;
+                    }
+                  } else if (Array.isArray(positionsResult)) {
+                    positions = positionsResult;
+                  }
+                  
+                  const position = positions.find((p: any) => p.symbol === SYMBOL);
+                  if (position && parseFloat(String(position.holdVol || 0)) > 0) {
+                    hasOpenPosition = true;
+                    console.log(`[MULTI-ACCOUNT] ⚠️ Обнаружена открытая позиция на бирже, пытаемся закрыть перед переключением`);
+                  }
+                }
+              } catch (checkError) {
+                console.error('[MULTI-ACCOUNT] Ошибка проверки открытых позиций:', checkError);
+              }
             }
             
+            // Если есть открытая позиция, пытаемся закрыть её
+            if (hasOpenPosition) {
+              let closeAttempts = 0;
+              const maxCloseAttempts = 3;
+              let closeSuccess = false;
+              
+              while (closeAttempts < maxCloseAttempts && !closeSuccess) {
+                closeAttempts++;
+                console.log(`[MULTI-ACCOUNT] Попытка ${closeAttempts}/${maxCloseAttempts} закрыть позицию перед переключением`);
+                
+                try {
+                  // Получаем текущий спред для закрытия
+                  if (currentSpread) {
+                    await closePosition(currentSpread);
+                    // Ждем немного, чтобы позиция закрылась
+                    await new Promise(resolve => setTimeout(resolve, 1000));
+                    
+                    // Проверяем, закрылась ли позиция
+                    const positionsResult: any = await tradingHandler.getOpenPositions(SYMBOL);
+                    let positions: any[] = [];
+                    if (positionsResult?.data) {
+                      const data: any = positionsResult.data;
+                      if (data && typeof data === 'object' && data.data && Array.isArray(data.data)) {
+                        positions = data.data;
+                      } else if (Array.isArray(data)) {
+                        positions = data;
+                      }
+                    } else if (Array.isArray(positionsResult)) {
+                      positions = positionsResult;
+                    }
+                    
+                    const position = positions.find((p: any) => p.symbol === SYMBOL);
+                    if (!position || parseFloat(String(position.holdVol || 0)) === 0) {
+                      closeSuccess = true;
+                      currentPosition = null;
+                      console.log(`[MULTI-ACCOUNT] ✅ Позиция успешно закрыта перед переключением`);
+                    } else {
+                      console.log(`[MULTI-ACCOUNT] ⚠️ Позиция все еще открыта, попытка ${closeAttempts}/${maxCloseAttempts}`);
+                    }
+                  } else {
+                    console.log(`[MULTI-ACCOUNT] ⚠️ Нет данных спреда для закрытия позиции`);
+                    break;
+                  }
+                } catch (closeError: any) {
+                  console.error(`[MULTI-ACCOUNT] Ошибка закрытия позиции (попытка ${closeAttempts}/${maxCloseAttempts}):`, closeError);
+                  if (closeAttempts >= maxCloseAttempts) {
+                    console.error(`[MULTI-ACCOUNT] ❌ Не удалось закрыть позицию после ${maxCloseAttempts} попыток, переключаемся на следующий аккаунт`);
+                  }
+                }
+              }
+              
+              if (!closeSuccess) {
+                console.error(`[MULTI-ACCOUNT] ⚠️ ВНИМАНИЕ: Позиция осталась открытой на аккаунте "${currentAccount?.name || currentAccount?.id || 'unknown'}"`);
+              }
+            }
+            
+            // ВАЖНО: Останавливаем торговлю на текущем аккаунте перед переключением
+            // Это сформирует отчет о проработанном аккаунте
+            if (currentAccount) {
+              try {
+                await stopTradingOnCurrentAccount(`Ошибка открытия позиции: ${errorMessage}`);
+              } catch (stopError) {
+                console.error('[MULTI-ACCOUNT] Ошибка остановки текущего аккаунта:', stopError);
+                // Помечаем аккаунт как error вручную, если stopTradingOnCurrentAccount не сработал
+                currentAccount.status = 'error';
+                currentAccount.stopReason = `Ошибка открытия позиции: ${errorMessage}`;
+              }
+            }
+            
+            // Сбрасываем currentPosition перед переключением
+            currentPosition = null;
+            
             try {
-              await switchToNextAccount(`Ошибка открытия позиции: ${error.message || errorMessage}`);
+              console.log(`[MULTI-ACCOUNT] 🔄 Переключаемся на следующий аккаунт из-за критической ошибки`);
+              const switchResult = await switchToNextAccount(`Ошибка открытия позиции: ${errorMessage}`);
+              console.log(`[MULTI-ACCOUNT] 🔍 switchToNextAccount вернул: ${switchResult}, isRunning: ${isRunning}`);
+              if (switchResult) {
+                console.log(`[MULTI-ACCOUNT] ✅ Успешно переключились на следующий аккаунт`);
+                console.log(`[MULTI-ACCOUNT] 🔍 Перед return: isRunning=${isRunning}, currentAccount=${currentAccount?.name || currentAccount?.id || 'null'}`);
+                // КРИТИЧЕСКИ ВАЖНО: После успешного переключения продолжаем торговлю
+                // isRunning должен остаться true, обработчики уже восстановлены в switchToAccount
+                // НЕ делаем ничего - просто продолжаем работу
+                console.log(`[MULTI-ACCOUNT] 🔍 ВЫХОДИМ ИЗ ОБРАБОТЧИКА ОШИБКИ ЧЕРЕЗ return`);
+                return; // Выходим из обработчика ошибки, торговля продолжается
+              } else {
+                console.log(`[MULTI-ACCOUNT] ⚠️ Не удалось переключиться на следующий аккаунт (возможно, все аккаунты недоступны)`);
+                // Если не удалось переключиться, НЕ останавливаем бота полностью
+                // Просто останавливаем торговлю на текущем аккаунте
+                if (isRunning) {
+                  console.log(`[MULTI-ACCOUNT] ⚠️ Торговля остановлена, но бот остается активным для возможного ручного переключения`);
+                }
+              }
             } catch (switchError: any) {
-              console.error('[MULTI-ACCOUNT] Ошибка переключения при ошибке открытия позиции:', switchError);
+              console.error('[MULTI-ACCOUNT] ❌ Ошибка переключения при ошибке открытия позиции:', switchError);
+              console.error('[MULTI-ACCOUNT] ❌ Stack trace:', switchError.stack);
+              // Если не удалось переключиться, останавливаем торговлю
+              if (isRunning) {
+                isRunning = false;
+                console.log('[MULTI-ACCOUNT] ⚠️ Торговля остановлена из-за ошибки переключения');
+              }
             }
           } else {
             // Если мультиаккаунтинг выключен, просто очищаем сигнал
@@ -2792,8 +3417,20 @@ async function switchToAccount(accountId: string, reason: string = 'switch'): Pr
       initialBalance
     });
     
-    // Снимаем флаг блокировки после успешного переключения
+    // КРИТИЧЕСКИ ВАЖНО: Устанавливаем время переключения ДО снятия флагов блокировки
+    // Это гарантирует, что проверка комиссии не произойдет сразу после переключения
+    lastAccountSwitchTime = Date.now(); // Сохраняем время переключения для предотвращения повторных переключений
+    console.log(`[MULTI-ACCOUNT] ⏰ Время переключения установлено: ${new Date(lastAccountSwitchTime).toISOString()}`);
+    
+    // ВАЖНО: Добавляем задержку перед снятием флагов блокировки
+    // Это дает аккаунту время на инициализацию перед обработкой сигналов
+    // и предотвращает попытки открыть позицию сразу после переключения
+    await new Promise(resolve => setTimeout(resolve, 3000)); // 3 секунды задержки
+    
+    // Снимаем флаги блокировки после успешного переключения и задержки
     isSwitchingAccount = false;
+    isWaitingForBalanceAndCommission = false; // Снимаем блокировку обновления баланса/комиссии
+    console.log(`[MULTI-ACCOUNT] ✅ Флаги блокировки сняты, торговля на аккаунте "${account.name || account.id}" готова к работе`);
     
     return true;
   } catch (error: any) {
@@ -2873,6 +3510,10 @@ async function switchToNextAccount(reason: string): Promise<boolean> {
   // Сохраняем ID текущего аккаунта перед переключением
   const currentAccountId = currentAccount?.id;
   
+  // КРИТИЧЕСКИ ВАЖНО: Сохраняем статус текущего аккаунта перед переключением
+  // Это нужно для правильной проверки доступных аккаунтов
+  const currentAccountStatus = currentAccount?.status;
+  
   // Находим следующий доступный аккаунт
   let nextIndex = multiAccountConfig.currentAccountIndex + 1;
   
@@ -2910,59 +3551,240 @@ async function switchToNextAccount(reason: string): Promise<boolean> {
   let attempts = 0;
   let foundAvailableAccount = false;
   
+  console.log(`[MULTI-ACCOUNT] 🔍 Ищем следующий доступный аккаунт (текущий: ${currentAccountId}, nextIndex: ${nextIndex}, всего аккаунтов: ${multiAccountConfig.accounts.length})`);
+  
   while (attempts < multiAccountConfig.accounts.length) {
     const nextAccount = multiAccountConfig.accounts[nextIndex];
     
+    console.log(`[MULTI-ACCOUNT] 🔍 Проверяем аккаунт "${nextAccount.name || nextAccount.id}" (индекс: ${nextIndex}, статус: ${nextAccount.status})`);
+    
     // КРИТИЧЕСКИ ВАЖНО: Пропускаем текущий аккаунт (который только что остановили)
     if (nextAccount.id === currentAccountId) {
+      console.log(`[MULTI-ACCOUNT] ⏭️ Пропускаем текущий аккаунт "${nextAccount.name || nextAccount.id}"`);
       nextIndex = (nextIndex + 1) % multiAccountConfig.accounts.length;
       attempts++;
       continue;
     }
     
     // Пропускаем аккаунты в статусе error и stopped (уже проторгованы)
-    if (nextAccount.status !== 'error' && nextAccount.status !== 'stopped') {
-      foundAvailableAccount = true;
-      try {
-        await switchToAccount(nextAccount.id, reason);
+    // ВАЖНО: Проверяем актуальный статус аккаунта, а не кэшированный
+    if (nextAccount.status === 'error' || nextAccount.status === 'stopped') {
+      console.log(`[MULTI-ACCOUNT] ⏭️ Пропускаем аккаунт "${nextAccount.name || nextAccount.id}" (статус: ${nextAccount.status})`);
+      nextIndex = (nextIndex + 1) % multiAccountConfig.accounts.length;
+      attempts++;
+      continue;
+    }
+    
+    // Нашли доступный аккаунт
+    foundAvailableAccount = true;
+    console.log(`[MULTI-ACCOUNT] ✅ Найден доступный аккаунт "${nextAccount.name || nextAccount.id}", переключаемся...`);
+    try {
+      const switchSuccess = await switchToAccount(nextAccount.id, reason);
+      if (switchSuccess) {
         logMultiAccount('switch', nextAccount, `Переключение на следующий аккаунт`, {
           reason
         });
-        return true;
-      } catch (error: any) {
-        console.error(`[MULTI-ACCOUNT] Ошибка переключения на аккаунт ${nextAccount.id}:`, error);
+        // КРИТИЧЕСКИ ВАЖНО: После успешного переключения возвращаем true
+        // Это означает, что переключение прошло успешно и торговля должна продолжиться
+        console.log(`[MULTI-ACCOUNT] ✅ Переключение успешно, возвращаем true из switchToNextAccount`);
+        return true; // ВЫХОДИМ ИЗ ФУНКЦИИ - код после цикла НЕ выполняется
+      } else {
+        // Если переключение не удалось, помечаем аккаунт как error и продолжаем поиск
+        console.log(`[MULTI-ACCOUNT] ⚠️ Переключение не удалось (switchSuccess === false), продолжаем поиск`);
         nextAccount.status = 'error';
-        nextAccount.stopReason = `Ошибка переключения: ${error.message}`;
-        // Пробуем следующий аккаунт
+        // КРИТИЧЕСКИ ВАЖНО: Не перезаписываем stopReason, если он уже установлен
+        // (например, в switchToAccount уже была установлена правильная причина остановки)
+        if (!nextAccount.stopReason) {
+          nextAccount.stopReason = `Ошибка переключения: переключение вернуло false`;
+        }
+        foundAvailableAccount = false;
       }
+    } catch (error: any) {
+      console.error(`[MULTI-ACCOUNT] ❌ Ошибка переключения на аккаунт ${nextAccount.id}:`, error);
+      nextAccount.status = 'error';
+      // КРИТИЧЕСКИ ВАЖНО: Не перезаписываем stopReason, если он уже установлен
+      // (например, в switchToAccount уже была установлена правильная причина остановки)
+      if (!nextAccount.stopReason) {
+        nextAccount.stopReason = `Ошибка переключения: ${error.message}`;
+      }
+      // Пробуем следующий аккаунт
+      foundAvailableAccount = false; // Сбрасываем флаг, чтобы продолжить поиск
     }
     
     nextIndex = (nextIndex + 1) % multiAccountConfig.accounts.length;
     attempts++;
   }
   
+  console.log(`[MULTI-ACCOUNT] ⚠️ Проверено ${attempts} аккаунтов, доступных не найдено`);
+  
   // Если не нашли доступный аккаунт, проверяем, все ли аккаунты проторгованы
   if (!foundAvailableAccount) {
+    // Логируем статусы всех аккаунтов для диагностики
+    console.log(`[MULTI-ACCOUNT] 📊 Статусы всех аккаунтов:`);
+    multiAccountConfig.accounts.forEach((acc, idx) => {
+      console.log(`[MULTI-ACCOUNT]   ${idx}: "${acc.name || acc.id}" - статус: ${acc.status}, причина: ${acc.stopReason || 'нет'}`);
+    });
+    
     const allAccountsTraded = multiAccountConfig.accounts.every(acc => 
       acc.status === 'stopped' || acc.status === 'error'
     );
     
+    console.log(`[MULTI-ACCOUNT] 🔍 Все аккаунты проторгованы: ${allAccountsTraded}`);
+    
     // ВАЖНО: Останавливаем торговлю на текущем аккаунте перед полной остановкой бота
+    // КРИТИЧЕСКИ ВАЖНО: Используем оригинальную причину из параметра reason, если аккаунт еще не остановлен
+    // Это сохраняет правильную причину остановки (например, "Превышено время торговли")
     if (currentAccount && currentAccount.status !== 'stopped' && currentAccount.status !== 'error') {
       try {
-        await stopTradingOnCurrentAccount(allAccountsTraded ? 'Все аккаунты проторгованы' : 'Все аккаунты недоступны');
+        // Используем оригинальную причину из параметра reason, если она есть
+        // Иначе используем общую причину
+        const stopReason = reason || (allAccountsTraded ? 'Все аккаунты проторгованы' : 'Все аккаунты недоступны');
+        await stopTradingOnCurrentAccount(stopReason);
+        // КРИТИЧЕСКИ ВАЖНО: После остановки аккаунта пересчитываем allAccountsTraded,
+        // так как статус аккаунта мог измениться
+        const allAccountsTradedAfterStop = multiAccountConfig.accounts.every(acc => 
+          acc.status === 'stopped' || acc.status === 'error'
+        );
+        console.log(`[MULTI-ACCOUNT] 🔍 После остановки текущего аккаунта, все проторгованы: ${allAccountsTradedAfterStop}`);
+        
+        // КРИТИЧЕСКИ ВАЖНО: Останавливаем бота ТОЛЬКО если все аккаунты проторгованы
+        // Используем обновленное значение после остановки текущего аккаунта
+        if (allAccountsTradedAfterStop) {
+          console.log('[MULTI-ACCOUNT] ✅ Все аккаунты проторгованы (после остановки текущего), останавливаем бота');
+          if (isRunning) {
+            isRunning = false;
+            
+            // КРИТИЧЕСКИ ВАЖНО: Проверяем и закрываем все открытые позиции перед остановкой
+            if (currentPosition || (tradingHandler.getClient() && currentAccount)) {
+              console.log('[MULTI-ACCOUNT] ⚠️ Проверяем открытые позиции перед остановкой бота...');
+              try {
+                // Проверяем, есть ли открытая позиция
+                let hasOpenPosition = false;
+                if (currentPosition) {
+                  hasOpenPosition = true;
+                } else {
+                  // Дополнительная проверка через API
+                  const positionsResult: any = await tradingHandler.getOpenPositions(SYMBOL);
+                  if (positionsResult) {
+                    let positions: any[] = [];
+                    if (positionsResult.data) {
+                      const data: any = positionsResult.data;
+                      if (data && typeof data === 'object' && data.data && Array.isArray(data.data)) {
+                        positions = data.data;
+                      } else if (Array.isArray(data)) {
+                        positions = data;
+                      }
+                    } else if (Array.isArray(positionsResult)) {
+                      positions = positionsResult;
+                    }
+                    
+                    const position = positions.find((p: any) => p.symbol === SYMBOL);
+                    if (position && parseFloat(String(position.holdVol || 0)) > 0) {
+                      hasOpenPosition = true;
+                    }
+                  }
+                }
+                
+                // Если есть открытая позиция, пытаемся закрыть её
+                if (hasOpenPosition && currentSpread) {
+                  console.log('[MULTI-ACCOUNT] ⚠️ Обнаружена открытая позиция, закрываем перед остановкой...');
+                  let closeAttempts = 0;
+                  const maxCloseAttempts = 3;
+                  let closeSuccess = false;
+                  
+                  while (closeAttempts < maxCloseAttempts && !closeSuccess) {
+                    closeAttempts++;
+                    try {
+                      await closePosition(currentSpread);
+                      // Ждем немного, чтобы позиция закрылась
+                      await new Promise(resolve => setTimeout(resolve, 1000));
+                      
+                      // Проверяем, закрылась ли позиция
+                      const positionsResult: any = await tradingHandler.getOpenPositions(SYMBOL);
+                      let positions: any[] = [];
+                      if (positionsResult?.data) {
+                        const data: any = positionsResult.data;
+                        if (data && typeof data === 'object' && data.data && Array.isArray(data.data)) {
+                          positions = data.data;
+                        } else if (Array.isArray(data)) {
+                          positions = data;
+                        }
+                      } else if (Array.isArray(positionsResult)) {
+                        positions = positionsResult;
+                      }
+                      
+                      const position = positions.find((p: any) => p.symbol === SYMBOL);
+                      if (!position || parseFloat(String(position.holdVol || 0)) === 0) {
+                        closeSuccess = true;
+                        currentPosition = null;
+                        console.log('[MULTI-ACCOUNT] ✅ Позиция успешно закрыта перед остановкой');
+                      } else {
+                        console.log(`[MULTI-ACCOUNT] ⚠️ Позиция все еще открыта, попытка ${closeAttempts}/${maxCloseAttempts}`);
+                      }
+                    } catch (closeError: any) {
+                      console.error(`[MULTI-ACCOUNT] Ошибка закрытия позиции (попытка ${closeAttempts}/${maxCloseAttempts}):`, closeError);
+                      if (closeAttempts >= maxCloseAttempts) {
+                        console.error(`[MULTI-ACCOUNT] ❌ КРИТИЧЕСКАЯ ОШИБКА: Не удалось закрыть позицию после ${maxCloseAttempts} попыток!`);
+                      }
+                    }
+                  }
+                  
+                  if (!closeSuccess) {
+                    console.error(`[MULTI-ACCOUNT] ❌ КРИТИЧЕСКАЯ ОШИБКА: Позиция осталась открытой на аккаунте "${currentAccount?.name || currentAccount?.id || 'unknown'}"!`);
+                  }
+                }
+              } catch (checkError) {
+                console.error('[MULTI-ACCOUNT] Ошибка проверки/закрытия позиций перед остановкой:', checkError);
+              }
+            }
+            
+            // Останавливаем обработчики и отключаем вебсокеты
+            if (binanceWS) {
+              binanceWS.onPriceUpdate = undefined;
+              binanceWS.onError = undefined;
+              binanceWS.onConnect = undefined;
+              binanceWS.onDisconnect = undefined;
+              binanceWS.disconnect();
+            }
+            if (mexcWS) {
+              mexcWS.onPriceUpdate = undefined;
+              mexcWS.onOrderbookUpdate = undefined;
+              mexcWS.onError = undefined;
+              mexcWS.onConnect = undefined;
+              mexcWS.onDisconnect = undefined;
+              mexcWS.disconnect();
+            }
+            if (priceMonitor) {
+              priceMonitor.onSpreadUpdate = undefined;
+            }
+            if (arbitrageStrategy) {
+              arbitrageStrategy.onSignal = undefined;
+              arbitrageStrategy.clearSignal();
+            }
+            currentPosition = null;
+            console.log('[MULTI-ACCOUNT] ✅ Бот полностью остановлен (вебсокеты отключены)');
+            
+            // Используем оригинальную причину из параметра reason, если она есть
+            const finalStopReason = reason || 'Все аккаунты проторгованы, бот остановлен';
+            logMultiAccount('stop', currentAccount || multiAccountConfig.accounts[0] || null, finalStopReason);
+          }
+          return false;
+        } else {
+          console.log('[MULTI-ACCOUNT] ⚠️ Не все аккаунты проторгованы после остановки текущего, НЕ останавливаем бота');
+          return false;
+        }
       } catch (error) {
         console.error('[MULTI-ACCOUNT] Ошибка остановки текущего аккаунта:', error);
       }
     }
     
+    // КРИТИЧЕСКИ ВАЖНО: Останавливаем бота ТОЛЬКО если все аккаунты проторгованы
+    // Проверяем это ПЕРВЫМ, чтобы не пропустить остановку
+    // (если текущий аккаунт уже был остановлен до вызова switchToNextAccount)
     if (allAccountsTraded) {
       console.log('[MULTI-ACCOUNT] ✅ Все аккаунты проторгованы, останавливаем бота');
-    } else {
-      console.log('[MULTI-ACCOUNT] ❌ Все аккаунты недоступны, останавливаем торговлю');
-    }
-    
-    if (isRunning) {
+      if (isRunning) {
+        console.log('[MULTI-ACCOUNT] 🛑 Останавливаем торговлю (isRunning = false)');
         isRunning = false;
         
         // КРИТИЧЕСКИ ВАЖНО: Проверяем и закрываем все открытые позиции перед остановкой
@@ -3073,10 +3895,17 @@ async function switchToNextAccount(reason: string): Promise<boolean> {
         }
         currentPosition = null;
         console.log('[MULTI-ACCOUNT] ✅ Бот полностью остановлен (вебсокеты отключены)');
+        
+        // Используем оригинальную причину из параметра reason, если она есть
+        const finalStopReason = reason || (allAccountsTraded ? 'Все аккаунты проторгованы, бот остановлен' : 'Все аккаунты недоступны, бот остановлен');
+        logMultiAccount('stop', currentAccount || multiAccountConfig.accounts[0] || null, finalStopReason);
       }
-      
-      logMultiAccount('stop', currentAccount || multiAccountConfig.accounts[0] || null, allAccountsTraded ? 'Все аккаунты проторгованы, бот остановлен' : 'Все аккаунты недоступны, бот остановлен');
-    return false;
+      return false;
+    } else {
+      // Если не все аккаунты проторгованы, НЕ останавливаем бота
+      console.log('[MULTI-ACCOUNT] ⚠️ Не все аккаунты проторгованы, НЕ останавливаем бота');
+      return false;
+    }
   }
   
   return false;
@@ -3088,12 +3917,14 @@ async function switchToNextAccount(reason: string): Promise<boolean> {
  */
 async function checkAccountSwitchConditions(): Promise<void> {
   if (!multiAccountConfig.enabled || !currentAccount || !isRunning) {
+    console.log(`[MULTI-ACCOUNT] Пропускаем проверку условий: enabled=${multiAccountConfig.enabled}, currentAccount=${!!currentAccount}, isRunning=${isRunning}`);
     return;
   }
   
   // КРИТИЧЕСКИ ВАЖНО: Не проверяем условия переключения во время тестирования аккаунта
   // Это может привести к неправильному переключению или остановке
   if (isTestingAccount) {
+    console.log('[MULTI-ACCOUNT] Пропускаем проверку условий переключения: идет тестирование аккаунта');
     return;
   }
   
@@ -3103,10 +3934,18 @@ async function checkAccountSwitchConditions(): Promise<void> {
     return;
   }
   
+  // КРИТИЧЕСКИ ВАЖНО: Не проверяем условия во время переключения аккаунта
+  if (isSwitchingAccount) {
+    console.log('[MULTI-ACCOUNT] Пропускаем проверку условий переключения: идет переключение аккаунта');
+    return;
+  }
+  
   try {
     // Используем кэшированный баланс (обновлен после закрытия позиции)
     // Не делаем новый запрос, чтобы не получить баланс с заблокированной маржой
     const balance = balanceCache?.balance || currentAccount.currentBalance || 0;
+    
+    console.log(`[MULTI-ACCOUNT] Проверка условий переключения: баланс=${balance.toFixed(8)}, minBalance=${minBalanceForTrading}, аккаунт="${currentAccount.name || currentAccount.id}"`);
     
     if (balance > 0) {
       currentAccount.currentBalance = balance;
@@ -3114,13 +3953,19 @@ async function checkAccountSwitchConditions(): Promise<void> {
     }
     
     // Проверка 1: Баланс >= targetBalance
+    // ВАЖНО: Эта проверка НЕ пропускается, даже если аккаунт только что переключился
     if (multiAccountConfig.targetBalance > 0 && balance >= multiAccountConfig.targetBalance) {
       await switchToNextAccount('Достигнут целевой баланс');
       return;
     }
     
     // Проверка 2: Баланс < minBalanceForTrading USDT
+    // ВАЖНО: Если баланс недостаточен, переключаемся сразу (без задержки 5 секунд),
+    // так как бот все равно не может торговать с объемом = 0
+    // Задержка в 5 секунд нужна только для проверки целевого баланса и времени торговли,
+    // чтобы не переключаться сразу после переключения из-за временных проблем
     if (balance < minBalanceForTrading) {
+      console.log(`[MULTI-ACCOUNT] ⚠️ Баланс (${balance.toFixed(8)} USDT) меньше минимального (${minBalanceForTrading} USDT), переключаемся на следующий аккаунт`);
       await switchToNextAccount(`Недостаточный баланс (< ${minBalanceForTrading} USDT)`);
       return;
     }
@@ -3216,6 +4061,9 @@ app.get('/api/multi-account/accounts', (req, res) => {
         status: acc.status,
         stopReason: acc.stopReason,
         tradesCount: acc.tradesCount,
+        totalTradedVolume: acc.totalTradedVolume,
+        totalTradedVolumeFormatted: formatVolume(acc.totalTradedVolume),
+        tradingTimeFormatted: formatTradingTime(acc.startTime),
         lastUpdateTime: acc.lastUpdateTime
       };
     });
@@ -3516,7 +4364,10 @@ app.get('/api/multi-account/status', (req, res) => {
       currentBalance: currentAccount.currentBalance,
       startTime: currentAccount.startTime,
       status: currentAccount.status,
-      tradesCount: currentAccount.tradesCount
+      tradesCount: currentAccount.tradesCount,
+      totalTradedVolume: currentAccount.totalTradedVolume,
+      totalTradedVolumeFormatted: formatVolume(currentAccount.totalTradedVolume),
+      tradingTimeFormatted: formatTradingTime(currentAccount.startTime)
     } : null;
     
     res.json({
@@ -3534,6 +4385,148 @@ app.get('/api/multi-account/status', (req, res) => {
   }
 });
 
+// Получить все отчеты о проработанных аккаунтах
+app.get('/api/account-reports', (req, res) => {
+  try {
+    res.json({ success: true, data: accountReports });
+  } catch (error: any) {
+    console.error('[REPORTS] Ошибка получения отчетов:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// Очистить все отчеты
+app.delete('/api/account-reports', async (req, res) => {
+  try {
+    accountReports.length = 0;
+    
+    // Сохраняем пустой массив в файл
+    await saveReportsToFile();
+    
+    res.json({ success: true, message: 'Все отчеты очищены' });
+  } catch (error: any) {
+    console.error('[REPORTS] Ошибка очистки отчетов:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// ==================== МИНИ-ПРИЛОЖЕНИЕ ДЛЯ РАБОТЫ С БАЛАНСАМИ ====================
+// ВАЖНО: Это отдельное мини-приложение, которое не мешает основному торговому боту
+
+// Получить баланс спотового счета
+app.post('/api/reports/spot-balance', async (req, res) => {
+  try {
+    const { apiKey, apiSecret } = req.body;
+    
+    if (!apiKey || !apiSecret) {
+      return res.status(400).json({ success: false, error: 'API Key и Secret обязательны' });
+    }
+
+    const client = new SpotApiClient(apiKey, apiSecret);
+    const balance = await client.getSpotBalance();
+    
+    res.json({ success: true, data: balance });
+  } catch (error: any) {
+    console.error('[REPORTS] Ошибка получения баланса спота:', error);
+    res.status(500).json({ 
+      success: false, 
+      error: error.response?.data?.msg || error.message || 'Ошибка получения баланса спота' 
+    });
+  }
+});
+
+// Получить баланс фьючерсного счета
+app.post('/api/reports/futures-balance', async (req, res) => {
+  try {
+    const { apiKey, apiSecret } = req.body;
+    
+    if (!apiKey || !apiSecret) {
+      return res.status(400).json({ success: false, error: 'API Key и Secret обязательны' });
+    }
+
+    const client = new SpotApiClient(apiKey, apiSecret);
+    const balance = await client.getFuturesBalance();
+    
+    res.json({ success: true, data: balance });
+  } catch (error: any) {
+    console.error('[REPORTS] Ошибка получения баланса фьючерсов:', error);
+    const errorMessage = error.response?.data?.msg || error.response?.data?.message || error.response?.data?.code || error.message || 'Ошибка получения баланса фьючерсов';
+    console.error('[REPORTS] Детали ошибки:', {
+      status: error.response?.status,
+      statusText: error.response?.statusText,
+      data: error.response?.data
+    });
+    res.status(500).json({ 
+      success: false, 
+      error: errorMessage
+    });
+  }
+});
+
+// Перевести со спота на фьючерсы
+app.post('/api/reports/transfer-spot-to-futures', async (req, res) => {
+  try {
+    const { apiKey, apiSecret, asset, amount } = req.body;
+    
+    if (!apiKey || !apiSecret) {
+      return res.status(400).json({ success: false, error: 'API Key и Secret обязательны' });
+    }
+    if (!asset || !amount) {
+      return res.status(400).json({ success: false, error: 'Asset и Amount обязательны' });
+    }
+
+    const client = new SpotApiClient(apiKey, apiSecret);
+    const result = await client.transferFunds('SPOT', 'FUTURES', asset, amount.toString());
+    
+    res.json({ success: true, data: result });
+  } catch (error: any) {
+    console.error('[REPORTS] Ошибка перевода со спота на фьючерсы:', error);
+    const errorMessage = error.response?.data?.msg || error.response?.data?.message || error.response?.data?.code || error.message || 'Ошибка перевода средств';
+    console.error('[REPORTS] Детали ошибки:', {
+      status: error.response?.status,
+      statusText: error.response?.statusText,
+      data: error.response?.data
+    });
+    res.status(500).json({ 
+      success: false, 
+      error: errorMessage
+    });
+  }
+});
+
+// Перевести с фьючерсов на спот
+app.post('/api/reports/transfer-futures-to-spot', async (req, res) => {
+  try {
+    const { apiKey, apiSecret, asset, amount } = req.body;
+    
+    if (!apiKey || !apiSecret) {
+      return res.status(400).json({ success: false, error: 'API Key и Secret обязательны' });
+    }
+    if (!asset || !amount) {
+      return res.status(400).json({ success: false, error: 'Asset и Amount обязательны' });
+    }
+
+    const client = new SpotApiClient(apiKey, apiSecret);
+    const result = await client.transferFunds('FUTURES', 'SPOT', asset, amount.toString());
+    
+    res.json({ success: true, data: result });
+  } catch (error: any) {
+    console.error('[REPORTS] Ошибка перевода с фьючерсов на спот:', error);
+    const errorMessage = error.response?.data?.msg || error.response?.data?.message || error.response?.data?.code || error.message || 'Ошибка перевода средств';
+    console.error('[REPORTS] Детали ошибки:', {
+      status: error.response?.status,
+      statusText: error.response?.statusText,
+      data: error.response?.data
+    });
+    res.status(500).json({ 
+      success: false, 
+      error: errorMessage
+    });
+  }
+});
+
+// ==================== КОНЕЦ МИНИ-ПРИЛОЖЕНИЯ ====================
+
 // ==================== КОНЕЦ МУЛЬТИАККАУНТИНГА ====================
 
 // Статические файлы (CSS, JS, изображения) - ПОСЛЕ API endpoints
@@ -3545,8 +4538,11 @@ app.get('*', (req, res) => {
 });
 
 // Start server
-app.listen(PORT, HOST, () => {
+app.listen(PORT, HOST, async () => {
   console.log(`🚀 Unified Trading Bot запущен на http://${HOST}:${PORT}`);
   console.log(`📊 Режим: ${NODE_ENV}`);
+  
+  // Загружаем отчеты из файла при старте сервера
+  await loadReportsFromFile();
 });
 

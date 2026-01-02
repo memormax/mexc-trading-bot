@@ -233,6 +233,7 @@
                             Загрузка статуса...
                         </div>
                         <button class="btn-secondary" onclick="loadMultiAccountStatus()" style="width: 100%; margin-top: 8px; padding: 6px;">🔄 Обновить статус</button>
+                        <button class="btn-primary" onclick="window.open('/reports.html', '_blank')" style="width: 100%; margin-top: 8px; padding: 6px;">📊 Показать отчет</button>
                     </div>
                 </section>
 
@@ -376,6 +377,7 @@
                     <div class="form-group">
                         <label for="symbol">Символ:</label>
                         <select id="symbol" onchange="loadMarketData()">
+                            <option value="UNI_USDT" selected>UNI/USDT</option>
                             <option value="BTC_USDT">BTC/USDT</option>
                             <option value="ETH_USDT">ETH/USDT</option>
                             <option value="BNB_USDT">BNB/USDT</option>

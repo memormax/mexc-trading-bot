@@ -330,3 +330,6 @@ if (this.currentSignal) {
 - Уменьшение MIN_ORDER_INTERVAL (может привести к rate limiting)
 - Кэширование analyzeExecution (нужно убедиться, что кэш инвалидируется правильно)
 
+
+
+

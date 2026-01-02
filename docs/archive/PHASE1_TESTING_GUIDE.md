@@ -325,3 +325,6 @@ fetch('/api/multi-account/status').then(r => r.json()).then(console.log);
 - Интеграцию с `/api/start` и `/api/stop`
 - Базовую логику переключения
 
+
+
+

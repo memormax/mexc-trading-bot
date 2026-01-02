@@ -252,3 +252,7 @@ await switchToAccount(nextAccount.id, reason);
 **Дата создания:** 2025-12-28  
 **Версия:** 1.0
 
+
+
+
+

@@ -1,0 +1,598 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Отчеты по аккаунтам - MEXC Trading Bot</title>
+    <link rel="stylesheet" href="styles.css">
+    <style>
+        .reports-container {
+            max-width: 1800px;
+            margin: 0 auto;
+            padding: 10px;
+        }
+        .reports-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 20px;
+        }
+        .reports-table {
+            width: 100%;
+            border-collapse: collapse;
+            background: #1e293b;
+            border-radius: 8px;
+            overflow: hidden;
+        }
+        .reports-table th,
+        .reports-table td {
+            padding: 12px;
+            text-align: left;
+            border-bottom: 1px solid #334155;
+            font-size: 12px;
+        }
+        .reports-table th {
+            background: #0f172a;
+            color: #60a5fa;
+            font-weight: 600;
+            position: sticky;
+            top: 0;
+            z-index: 10;
+        }
+        .reports-table tr:hover {
+            background: #334155;
+        }
+        .reports-table td {
+            color: #e2e8f0;
+        }
+        .account-info {
+            display: flex;
+            flex-direction: column;
+            gap: 4px;
+        }
+        .account-name {
+            font-weight: 600;
+            color: #60a5fa;
+        }
+        .account-key {
+            font-size: 11px;
+            color: #94a3b8;
+            font-family: 'Courier New', monospace;
+            word-break: break-all;
+        }
+        .trading-stats {
+            display: flex;
+            flex-direction: column;
+            gap: 4px;
+        }
+        .profit-positive {
+            color: #10b981;
+        }
+        .profit-negative {
+            color: #ef4444;
+        }
+        .empty-state {
+            text-align: center;
+            padding: 40px;
+            color: #94a3b8;
+        }
+        .btn-clear {
+            padding: 8px 16px;
+        }
+    </style>
+</head>
+<body>
+    <div class="reports-container">
+        <header>
+            <h1>📊 Отчеты по проработанным аккаунтам</h1>
+            <div class="connection-status">
+                <span class="status-dot"></span>
+                <span id="connectionStatus">Загрузка...</span>
+            </div>
+        </header>
+
+        <div class="reports-header">
+            <div>
+                <button class="btn-secondary" onclick="loadReports()" style="margin-right: 10px;">🔄 Обновить</button>
+                <button class="btn-danger btn-clear" onclick="clearReports()">🗑️ Очистить</button>
+            </div>
+            <div style="color: #94a3b8; font-size: 12px;">
+                Всего отчетов: <span id="reportsCount">0</span>
+            </div>
+        </div>
+
+        <div class="card">
+            <div id="reportsTableContainer">
+                <table class="reports-table">
+                    <thead>
+                        <tr>
+                            <th style="width: 25%;">Аккаунт и ключи</th>
+                            <th style="width: 30%;">Статистика торговли</th>
+                            <th style="width: 25%;">Баланс и объем</th>
+                            <th style="width: 20%;">Управление балансом</th>
+                        </tr>
+                    </thead>
+                    <tbody id="reportsTableBody">
+                        <tr>
+                            <td colspan="3" class="empty-state">Загрузка отчетов...</td>
+                        </tr>
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        const API_BASE = window.location.origin;
+
+        async function apiRequest(endpoint, options = {}) {
+            try {
+                const config = {
+                    ...options,
+                    headers: {
+                        'Content-Type': 'application/json',
+                        ...options.headers
+                    }
+                };
+                
+                // Если есть body, убеждаемся что это строка
+                if (config.body && typeof config.body !== 'string') {
+                    config.body = JSON.stringify(config.body);
+                }
+                
+                const response = await fetch(`${API_BASE}${endpoint}`, config);
+                return await response.json();
+            } catch (error) {
+                console.error('API Error:', error);
+                throw error;
+            }
+        }
+
+        function formatDateTime(timestamp) {
+            const date = new Date(timestamp);
+            return date.toLocaleString('ru-RU', {
+                year: 'numeric',
+                month: '2-digit',
+                day: '2-digit',
+                hour: '2-digit',
+                minute: '2-digit',
+                second: '2-digit'
+            });
+        }
+
+        function formatTime(minutes) {
+            const hours = Math.floor(minutes / 60);
+            const mins = Math.floor(minutes % 60);
+            if (hours > 0) {
+                return `${hours}ч ${mins}м`;
+            }
+            return `${mins}м`;
+        }
+
+        function formatNumber(num) {
+            return num.toFixed(2);
+        }
+
+        // Функция для маскирования API ключей (первые 4 символа + ... + последние 4 символа)
+        function maskApiKey(key) {
+            if (!key || key.length <= 8) {
+                return key; // Если ключ слишком короткий, возвращаем как есть
+            }
+            return key.substring(0, 4) + '...' + key.substring(key.length - 4);
+        }
+
+        function renderReports(reports) {
+            const tbody = document.getElementById('reportsTableBody');
+            const countSpan = document.getElementById('reportsCount');
+            
+            countSpan.textContent = reports.length;
+
+            if (reports.length === 0) {
+                tbody.innerHTML = '<tr><td colspan="3" class="empty-state">Нет отчетов. Отчеты будут появляться после остановки торговли на аккаунтах.</td></tr>';
+                return;
+            }
+
+            // Сортируем отчеты по времени (новые сверху)
+            const sortedReports = [...reports].sort((a, b) => b.timestamp - a.timestamp);
+
+            tbody.innerHTML = sortedReports.map(report => {
+                const profitClass = report.profit >= 0 ? 'profit-positive' : 'profit-negative';
+                const profitSign = report.profit >= 0 ? '+' : '';
+                
+                return `
+                    <tr>
+                        <td>
+                            <div class="account-info">
+                                <div class="account-name">${report.accountName}</div>
+                                <div class="account-key">API Key: ${maskApiKey(report.apiKey)}</div>
+                                <div class="account-key">API Secret: ${maskApiKey(report.apiSecret)}</div>
+                                <div class="account-key">WEB Token: ${maskApiKey(report.webToken)}</div>
+                            </div>
+                        </td>
+                        <td>
+                            <div class="trading-stats">
+                                <div><strong>Время торговли:</strong></div>
+                                <div>${formatDateTime(report.startTime)} - ${formatDateTime(report.endTime)}</div>
+                                <div style="margin-top: 8px;"><strong>Общее время:</strong> ${formatTime(report.tradingTimeMinutes)}</div>
+                                <div style="margin-top: 8px;"><strong>Сделок:</strong> ${report.tradesCount}</div>
+                                <div style="margin-top: 8px;"><strong>Причина остановки:</strong> ${report.stopReason}</div>
+                            </div>
+                        </td>
+                        <td>
+                            <div class="trading-stats">
+                                <div><strong>Начальный баланс:</strong> ${formatNumber(report.initialBalance)} USDT</div>
+                                <div><strong>Финальный баланс:</strong> ${formatNumber(report.finalBalance)} USDT</div>
+                                <div class="${profitClass}"><strong>Профит:</strong> ${profitSign}${formatNumber(report.profit)} USDT</div>
+                                <div style="margin-top: 8px;"><strong>Проторгованный объем:</strong> ${formatNumber(report.totalTradedVolume)} USDT</div>
+                            </div>
+                        </td>
+                        <td>
+                            <div class="balance-controls" style="display: flex; flex-direction: column; gap: 6px;">
+                                <div style="display: flex; align-items: center; gap: 8px;">
+                                    <button class="btn-secondary" style="font-size: 11px; padding: 6px; flex: 0 0 auto;" onclick="getSpotBalance('${report.apiKey}', '${report.apiSecret}', '${report.accountName}', this)">
+                                        💰 Баланс спота
+                                    </button>
+                                    <span class="spot-balance-${report.accountName.replace(/[^a-zA-Z0-9]/g, '_')}" style="font-size: 11px; color: #94a3b8; flex: 1;"></span>
+                                </div>
+                                <div style="display: flex; align-items: center; gap: 8px;">
+                                    <button class="btn-secondary" style="font-size: 11px; padding: 6px; flex: 0 0 auto;" onclick="getFuturesBalance('${report.apiKey}', '${report.apiSecret}', '${report.accountName}', this)">
+                                        📊 Баланс фьючей
+                                    </button>
+                                    <span class="futures-balance-${report.accountName.replace(/[^a-zA-Z0-9]/g, '_')}" style="font-size: 11px; color: #94a3b8; flex: 1;"></span>
+                                </div>
+                                <div style="display: flex; align-items: center; gap: 8px;">
+                                    <button class="btn-secondary" style="font-size: 11px; padding: 6px; flex: 0 0 auto;" onclick="transferSpotToFutures('${report.apiKey}', '${report.apiSecret}', '${report.accountName}', this)">
+                                        ➡️ Спот → Фьючи
+                                    </button>
+                                    <span class="transfer-status-spot-futures-${report.accountName.replace(/[^a-zA-Z0-9]/g, '_')}" style="font-size: 11px; flex: 1;"></span>
+                                </div>
+                                <div style="display: flex; align-items: center; gap: 8px;">
+                                    <button class="btn-secondary" style="font-size: 11px; padding: 6px; flex: 0 0 auto;" onclick="transferFuturesToSpot('${report.apiKey}', '${report.apiSecret}', '${report.accountName}', this)">
+                                        ⬅️ Фьючи → Спот
+                                    </button>
+                                    <span class="transfer-status-futures-spot-${report.accountName.replace(/[^a-zA-Z0-9]/g, '_')}" style="font-size: 11px; flex: 1;"></span>
+                                </div>
+                            </div>
+                        </td>
+                    </tr>
+                `;
+            }).join('');
+        }
+
+        async function loadReports() {
+            try {
+                const result = await apiRequest('/api/account-reports');
+                if (result.success) {
+                    renderReports(result.data);
+                } else {
+                    console.error('Ошибка загрузки отчетов:', result.error);
+                }
+            } catch (error) {
+                console.error('Ошибка загрузки отчетов:', error);
+                document.getElementById('reportsTableBody').innerHTML = 
+                    '<tr><td colspan="4" class="empty-state" style="color: #ef4444;">Ошибка загрузки отчетов</td></tr>';
+            }
+        }
+
+        // Функции для работы с балансами
+        async function getSpotBalance(apiKey, apiSecret, accountName, buttonElement) {
+            const safeName = accountName.replace(/[^a-zA-Z0-9]/g, '_');
+            const balanceElement = document.querySelector(`.spot-balance-${safeName}`);
+            
+            if (balanceElement) {
+                balanceElement.textContent = 'Загрузка...';
+                balanceElement.style.color = '#94a3b8';
+            }
+            
+            try {
+                const result = await apiRequest('/api/reports/spot-balance', {
+                    method: 'POST',
+                    body: JSON.stringify({ apiKey, apiSecret })
+                });
+                
+                if (result.success && balanceElement) {
+                    // Парсим баланс из ответа
+                    let balanceText = '';
+                    if (result.data && result.data.balances) {
+                        const usdtBalance = result.data.balances.find(b => b.asset === 'USDT');
+                        if (usdtBalance) {
+                            const free = parseFloat(usdtBalance.free);
+                            const locked = parseFloat(usdtBalance.locked);
+                            if (free > 0 || locked > 0) {
+                                balanceText = `${free.toFixed(2)} USDT`;
+                                if (locked > 0) {
+                                    balanceText += ` (заблок: ${locked.toFixed(2)})`;
+                                }
+                            } else {
+                                balanceText = '0 USDT';
+                            }
+                        } else {
+                            // Ищем первый баланс с ненулевым значением
+                            const nonZeroBalance = result.data.balances.find(b => parseFloat(b.free) > 0 || parseFloat(b.locked) > 0);
+                            if (nonZeroBalance) {
+                                balanceText = `${nonZeroBalance.asset}: ${parseFloat(nonZeroBalance.free).toFixed(4)}`;
+                            } else {
+                                balanceText = 'Нет баланса';
+                            }
+                        }
+                    } else {
+                        balanceText = 'Ошибка формата';
+                    }
+                    balanceElement.textContent = balanceText;
+                    balanceElement.style.color = '#60a5fa';
+                } else {
+                    if (balanceElement) {
+                        balanceElement.textContent = `Ошибка: ${result.error || 'Неизвестная ошибка'}`;
+                        balanceElement.style.color = '#ef4444';
+                    }
+                }
+            } catch (error) {
+                console.error('Ошибка получения баланса спота:', error);
+                if (balanceElement) {
+                    balanceElement.textContent = 'Ошибка запроса';
+                    balanceElement.style.color = '#ef4444';
+                }
+            }
+        }
+
+        async function getFuturesBalance(apiKey, apiSecret, accountName, buttonElement) {
+            const safeName = accountName.replace(/[^a-zA-Z0-9]/g, '_');
+            const balanceElement = document.querySelector(`.futures-balance-${safeName}`);
+            
+            if (balanceElement) {
+                balanceElement.textContent = 'Загрузка...';
+                balanceElement.style.color = '#94a3b8';
+            }
+            
+            try {
+                const result = await apiRequest('/api/reports/futures-balance', {
+                    method: 'POST',
+                    body: JSON.stringify({ apiKey, apiSecret })
+                });
+                
+                if (result.success && balanceElement) {
+                    // Парсим баланс из ответа
+                    let balanceText = '';
+                    // Проверяем разные форматы ответа
+                    if (result.data) {
+                        // Формат 1: result.data.data
+                        if (result.data.data) {
+                            const data = result.data.data;
+                            if (data.availableBalance !== undefined) {
+                                balanceText = `${parseFloat(data.availableBalance).toFixed(2)} USDT`;
+                                if (data.frozenBalance && parseFloat(data.frozenBalance) > 0) {
+                                    balanceText += ` (заблок: ${parseFloat(data.frozenBalance).toFixed(2)})`;
+                                }
+                            } else if (data.totalBalance !== undefined) {
+                                balanceText = `${parseFloat(data.totalBalance).toFixed(2)} USDT`;
+                            } else if (data.balance !== undefined) {
+                                balanceText = `${parseFloat(data.balance).toFixed(2)} USDT`;
+                            }
+                        }
+                        // Формат 2: result.data напрямую
+                        else if (result.data.availableBalance !== undefined) {
+                            balanceText = `${parseFloat(result.data.availableBalance).toFixed(2)} USDT`;
+                        } else if (result.data.totalBalance !== undefined) {
+                            balanceText = `${parseFloat(result.data.totalBalance).toFixed(2)} USDT`;
+                        } else if (result.data.balance !== undefined) {
+                            balanceText = `${parseFloat(result.data.balance).toFixed(2)} USDT`;
+                        }
+                        // Формат 3: массив с балансами
+                        else if (Array.isArray(result.data) && result.data.length > 0) {
+                            const usdtAsset = result.data.find(a => a.currency === 'USDT' || a.asset === 'USDT');
+                            if (usdtAsset) {
+                                balanceText = `${parseFloat(usdtAsset.availableBalance || usdtAsset.balance || 0).toFixed(2)} USDT`;
+                            }
+                        }
+                    }
+                    
+                    if (!balanceText) {
+                        balanceText = 'Нет данных';
+                        console.log('[REPORTS] Неизвестный формат ответа баланса фьючерсов:', result.data);
+                    }
+                    
+                    balanceElement.textContent = balanceText;
+                    balanceElement.style.color = '#60a5fa';
+                } else {
+                    if (balanceElement) {
+                        balanceElement.textContent = `Ошибка: ${result.error || 'Неизвестная ошибка'}`;
+                        balanceElement.style.color = '#ef4444';
+                    }
+                }
+            } catch (error) {
+                console.error('Ошибка получения баланса фьючерсов:', error);
+                if (balanceElement) {
+                    balanceElement.textContent = 'Ошибка запроса';
+                    balanceElement.style.color = '#ef4444';
+                }
+            }
+        }
+
+        async function transferSpotToFutures(apiKey, apiSecret, accountName, buttonElement) {
+            const safeName = accountName.replace(/[^a-zA-Z0-9]/g, '_');
+            const statusElement = document.querySelector(`.transfer-status-spot-futures-${safeName}`);
+            
+            if (statusElement) {
+                statusElement.textContent = 'Получение баланса...';
+                statusElement.style.color = '#94a3b8';
+            }
+
+            try {
+                // Сначала получаем баланс спота
+                const balanceResult = await apiRequest('/api/reports/spot-balance', {
+                    method: 'POST',
+                    body: JSON.stringify({ apiKey, apiSecret })
+                });
+                
+                if (!balanceResult.success) {
+                    if (statusElement) {
+                        statusElement.textContent = `❌ Ошибка получения баланса: ${balanceResult.error || 'Неизвестная ошибка'}`;
+                        statusElement.style.color = '#ef4444';
+                    }
+                    return;
+                }
+
+                // Ищем баланс USDT
+                let amount = 0;
+                if (balanceResult.data && balanceResult.data.balances) {
+                    const usdtBalance = balanceResult.data.balances.find(b => b.asset === 'USDT');
+                    if (usdtBalance) {
+                        amount = parseFloat(usdtBalance.free);
+                    }
+                }
+
+                if (amount <= 0) {
+                    if (statusElement) {
+                        statusElement.textContent = '❌ Нет баланса для перевода';
+                        statusElement.style.color = '#ef4444';
+                    }
+                    return;
+                }
+
+                if (statusElement) {
+                    statusElement.textContent = `Перевод ${amount.toFixed(2)} USDT...`;
+                    statusElement.style.color = '#94a3b8';
+                }
+
+                // Выполняем перевод всего баланса
+                const result = await apiRequest('/api/reports/transfer-spot-to-futures', {
+                    method: 'POST',
+                    body: JSON.stringify({ apiKey, apiSecret, asset: 'USDT', amount: amount })
+                });
+                
+                if (result.success && statusElement) {
+                    statusElement.textContent = '✅ Успешно';
+                    statusElement.style.color = '#10b981';
+                    // НЕ очищаем статус - пусть остается видимым
+                } else {
+                    if (statusElement) {
+                        const errorMsg = result.error || 'Неизвестная ошибка';
+                        statusElement.textContent = `❌ ${errorMsg.length > 30 ? errorMsg.substring(0, 30) + '...' : errorMsg}`;
+                        statusElement.style.color = '#ef4444';
+                    }
+                }
+            } catch (error) {
+                console.error('Ошибка перевода со спота на фьючерсы:', error);
+                if (statusElement) {
+                    statusElement.textContent = '❌ Ошибка';
+                    statusElement.style.color = '#ef4444';
+                }
+            }
+        }
+
+        async function transferFuturesToSpot(apiKey, apiSecret, accountName, buttonElement) {
+            const safeName = accountName.replace(/[^a-zA-Z0-9]/g, '_');
+            const statusElement = document.querySelector(`.transfer-status-futures-spot-${safeName}`);
+            
+            if (statusElement) {
+                statusElement.textContent = 'Получение баланса...';
+                statusElement.style.color = '#94a3b8';
+            }
+
+            try {
+                // Сначала получаем баланс фьючерсов
+                const balanceResult = await apiRequest('/api/reports/futures-balance', {
+                    method: 'POST',
+                    body: JSON.stringify({ apiKey, apiSecret })
+                });
+                
+                if (!balanceResult.success) {
+                    if (statusElement) {
+                        statusElement.textContent = `❌ Ошибка получения баланса: ${balanceResult.error || 'Неизвестная ошибка'}`;
+                        statusElement.style.color = '#ef4444';
+                    }
+                    return;
+                }
+
+                // Ищем доступный баланс USDT
+                let amount = 0;
+                if (balanceResult.data && balanceResult.data.data) {
+                    const data = balanceResult.data.data;
+                    if (data.availableBalance !== undefined) {
+                        amount = parseFloat(data.availableBalance);
+                    } else if (data.totalBalance !== undefined) {
+                        amount = parseFloat(data.totalBalance);
+                    }
+                }
+
+                if (amount <= 0) {
+                    if (statusElement) {
+                        statusElement.textContent = '❌ Нет баланса для перевода';
+                        statusElement.style.color = '#ef4444';
+                    }
+                    return;
+                }
+
+                if (statusElement) {
+                    statusElement.textContent = `Перевод ${amount.toFixed(2)} USDT...`;
+                    statusElement.style.color = '#94a3b8';
+                }
+
+                // Выполняем перевод всего баланса
+                const result = await apiRequest('/api/reports/transfer-futures-to-spot', {
+                    method: 'POST',
+                    body: JSON.stringify({ apiKey, apiSecret, asset: 'USDT', amount: amount })
+                });
+                
+                if (result.success && statusElement) {
+                    statusElement.textContent = '✅ Успешно';
+                    statusElement.style.color = '#10b981';
+                    // НЕ очищаем статус - пусть остается видимым
+                } else {
+                    if (statusElement) {
+                        const errorMsg = result.error || 'Неизвестная ошибка';
+                        statusElement.textContent = `❌ ${errorMsg.length > 30 ? errorMsg.substring(0, 30) + '...' : errorMsg}`;
+                        statusElement.style.color = '#ef4444';
+                    }
+                }
+            } catch (error) {
+                console.error('Ошибка перевода с фьючерсов на спот:', error);
+                if (statusElement) {
+                    statusElement.textContent = '❌ Ошибка';
+                    statusElement.style.color = '#ef4444';
+                }
+            }
+        }
+
+        // Делаем функции доступными глобально
+        window.getSpotBalance = getSpotBalance;
+        window.getFuturesBalance = getFuturesBalance;
+        window.transferSpotToFutures = transferSpotToFutures;
+        window.transferFuturesToSpot = transferFuturesToSpot;
+
+        async function clearReports() {
+            if (!confirm('Вы уверены, что хотите очистить все отчеты? Это действие нельзя отменить.')) {
+                return;
+            }
+
+            try {
+                const result = await apiRequest('/api/account-reports', {
+                    method: 'DELETE'
+                });
+                if (result.success) {
+                    alert('Все отчеты очищены');
+                    loadReports();
+                } else {
+                    alert('Ошибка очистки отчетов: ' + result.error);
+                }
+            } catch (error) {
+                console.error('Ошибка очистки отчетов:', error);
+                alert('Ошибка очистки отчетов');
+            }
+        }
+
+        // Делаем функции доступными глобально
+        window.maskApiKey = maskApiKey;
+        window.loadReports = loadReports;
+        window.clearReports = clearReports;
+
+        // Загружаем отчеты при загрузке страницы
+        document.addEventListener('DOMContentLoaded', () => {
+            loadReports();
+            // Обновляем каждые 5 секунд
+            setInterval(loadReports, 5000);
+        });
+    </script>
+</body>
+</html>
+

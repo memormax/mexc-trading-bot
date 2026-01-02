@@ -41,3 +41,7 @@ ecosystem.config.js.local
 tmp/
 temp/
 *.tmp
+
+# Data files (reports, etc.)
+data/
+!data/.gitkeep
