@@ -154,28 +154,37 @@ const MAX_LOGS = 100; // Максимальное количество лого�
 const accountReports: AccountReport[] = [];
 
 // Путь к файлу для сохранения отчетов
-const REPORTS_FILE_PATH = path.join(__dirname, '..', 'data', 'account-reports.json');
+// Путь к файлу отчетов: относительно корня проекта (не dist/)
+// На сервере: /root/unified-bot/data/account-reports.json
+// В разработке: D:\Cursors\uid\unified-bot\data\account-reports.json
+const REPORTS_FILE_PATH = path.join(process.cwd(), 'data', 'account-reports.json');
 
 /**
  * Загрузка отчетов из файла при старте сервера
  */
 async function loadReportsFromFile(): Promise<void> {
   try {
+    console.log(`[REPORTS] 🔍 Путь к файлу отчетов: ${REPORTS_FILE_PATH}`);
+    console.log(`[REPORTS] 🔍 Текущая рабочая директория: ${process.cwd()}`);
+    console.log(`[REPORTS] 🔍 __dirname: ${__dirname}`);
+    
     // Проверяем, существует ли файл
     try {
       await fs.access(REPORTS_FILE_PATH);
+      console.log(`[REPORTS] ✅ Файл отчетов найден: ${REPORTS_FILE_PATH}`);
     } catch {
       // Файл не существует, создаем директорию если нужно
       const dataDir = path.dirname(REPORTS_FILE_PATH);
+      console.log(`[REPORTS] 📁 Создаем директорию для отчетов: ${dataDir}`);
       await fs.mkdir(dataDir, { recursive: true });
-      console.log('[REPORTS] Файл отчетов не найден, будет создан при первом сохранении');
+      console.log('[REPORTS] ✅ Директория создана. Файл отчетов будет создан при первом сохранении');
       return;
     }
     
     // Читаем файл
     const fileContent = await fs.readFile(REPORTS_FILE_PATH, 'utf-8');
     if (!fileContent || fileContent.trim() === '') {
-      console.log('[REPORTS] Файл отчетов пуст');
+      console.log('[REPORTS] ℹ️ Файл отчетов пуст');
       return;
     }
     
@@ -191,7 +200,8 @@ async function loadReportsFromFile(): Promise<void> {
     }
   } catch (error: any) {
     // Ошибка загрузки не должна останавливать сервер
-    console.error('[REPORTS] Ошибка загрузки отчетов из файла:', error.message);
+    console.error('[REPORTS] ❌ Ошибка загрузки отчетов из файла:', error.message);
+    console.error('[REPORTS] ❌ Stack trace:', error.stack);
     console.log('[REPORTS] Продолжаем работу с пустым списком отчетов');
   }
 }
@@ -4388,9 +4398,10 @@ app.get('/api/multi-account/status', (req, res) => {
 // Получить все отчеты о проработанных аккаунтах
 app.get('/api/account-reports', (req, res) => {
   try {
+    console.log(`[REPORTS] 📊 Запрос отчетов. Всего в памяти: ${accountReports.length}`);
     res.json({ success: true, data: accountReports });
   } catch (error: any) {
-    console.error('[REPORTS] Ошибка получения отчетов:', error);
+    console.error('[REPORTS] ❌ Ошибка получения отчетов:', error);
     res.status(500).json({ success: false, error: error.message });
   }
 });
