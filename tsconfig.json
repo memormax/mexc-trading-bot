@@ -11,9 +11,15 @@
     "resolveJsonModule": true,
     "moduleResolution": "node"
   },
-  "include": ["src/**/*", "server.ts"],
+  "include": ["src/**/*", "server.ts", "services/**/*"],
   "exclude": ["node_modules", "dist"]
 }
+
+
+
+
+
+
 
 
 

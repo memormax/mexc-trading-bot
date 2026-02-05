@@ -2,6 +2,7 @@ import express from 'express';
 import cors from 'cors';
 import path from 'path';
 import fs from 'fs/promises';
+import session from 'express-session';
 import { BinanceWebSocketClient } from './src/websocket/binance-ws';
 import { MEXCWebSocketClient } from './src/websocket/mexc-ws';
 import { PriceMonitor } from './src/monitor/price-monitor';
@@ -10,6 +11,12 @@ import { ArbitrageStrategy } from './src/trading/arbitrage-strategy';
 import * as tradingHandler from './src/trading-handler';
 import { ApiKeyClient } from './src/api-key-client';
 import { SpotApiClient } from './src/spot-api-client';
+import { registerFermRoutes, initializeFermService } from './services/ferm';
+import * as fermService from './services/ferm/service';
+import * as sharedAuth from './services/shared/auth';
+import * as sharedUsers from './services/shared/users';
+import * as botLock from './services/shared/bot-lock';
+import * as flipUserData from './services/flip/user-data';
 
 // ==================== МУЛЬТИАККАУНТИНГ: ИНТЕРФЕЙСЫ И ТИПЫ ====================
 
@@ -32,6 +39,7 @@ interface Account {
 interface MultiAccountConfig {
   enabled: boolean;              // Включен ли мультиаккаунтинг
   accounts: Account[];          // Список аккаунтов
+  tradeTimeoutSeconds?: number; // Таймаут между сделками в секундах
   currentAccountIndex: number;  // Индекс текущего аккаунта (-1 если нет активного)
   targetBalance: number;        // Финальный баланс (остановка при достижении)
   maxTradingTimeMinutes: number; // Максимальное время торговли (в минутах)
@@ -75,8 +83,24 @@ const NODE_ENV = process.env.NODE_ENV || 'development';
 const isProduction = NODE_ENV === 'production';
 
 // Middleware
-app.use(cors());
+app.use(cors({
+  origin: true,
+  credentials: true
+}));
 app.use(express.json({ limit: '10mb' }));
+
+// Настройка сессий для Ferm Service
+app.use(session({
+  name: 'ferm.sid',
+  secret: process.env.SESSION_SECRET || 'ferm-secret-key-change-in-production',
+  resave: false,
+  saveUninitialized: false,
+  cookie: {
+    secure: false, // В production установить true для HTTPS
+    httpOnly: true,
+    maxAge: 24 * 60 * 60 * 1000 // 24 часа
+  }
+}));
 
 // ВАЖНО: Статические файлы должны быть ПОСЛЕ API endpoints, но ДО catch-all route
 // Сначала регистрируем все API endpoints, потом статику, потом catch-all
@@ -110,6 +134,7 @@ let stopAfterClose: boolean = false; // Флаг для остановки бо�
 let pendingAccountSwitch: { reason: string } | null = null; // Флаг для переключения аккаунта после закрытия позиции
 let isSwitchingAccount: boolean = false; // Флаг для блокировки открытия позиций во время переключения аккаунта
 let isWaitingForBalanceAndCommission: boolean = false; // Флаг для блокировки открытия позиций до обновления баланса и проверки комиссии
+let isWaitingForTradeTimeout: boolean = false; // Флаг для блокировки открытия позиций во время таймаута между сделками
 let lastOrderTime: number = 0; // Время последнего ордера (для rate limiting)
 let rateLimitBlockedUntil: number = 0; // Время до которого заблокированы запросы из-за "too frequent" (0 = не заблокировано)
 const RATE_LIMIT_TIMEOUT = 10000; // Таймаут при ошибке "too frequent" (10 секунд)
@@ -125,6 +150,8 @@ let autoVolumePercent: number = 90; // Процент от баланса для
 let autoVolumeMax: number = 3500; // Максимальный объем для автообъема (USDT)
 let marginMode: 'isolated' | 'cross' = 'isolated'; // Режим маржи: isolated (изолированная) или cross (кросс)
 let minBalanceForTrading: number = 0.5; // Минимальный баланс для торговли (USDT)
+let minTickDifference: number = 2; // Минимальная разница в тиках для открытия позиции
+let maxSlippagePercent: number = 0.1; // Максимальное проскальзывание в процентах
 
 // ОПТИМИЗАЦИЯ: Кэш данных контракта для избежания повторных запросов
 let contractCache: { symbol: string; data: any; timestamp: number } | null = null;
@@ -143,7 +170,8 @@ let multiAccountConfig: MultiAccountConfig = {
   accounts: [],
   currentAccountIndex: -1,
   targetBalance: 0,
-  maxTradingTimeMinutes: 0
+  maxTradingTimeMinutes: 0,
+  tradeTimeoutSeconds: 0
 };
 
 let currentAccount: Account | null = null;
@@ -261,7 +289,7 @@ async function initializeComponents(symbol: string = SYMBOL) {
     const contractDetail = await tradingHandler.getContractDetail(SYMBOL);
     if (contractDetail && contractDetail.data) {
       const contract = Array.isArray(contractDetail.data) 
-        ? contractDetail.data.find(c => c.symbol === SYMBOL) || contractDetail.data[0]
+        ? contractDetail.data.find((c: any) => c.symbol === SYMBOL) || contractDetail.data[0]
         : contractDetail.data;
       
       if (contract.priceScale !== undefined) {
@@ -408,9 +436,16 @@ function setupHandlers() {
     }
     
     // КРИТИЧЕСКИ ВАЖНО: Блокируем открытие позиций до обновления баланса и проверки комиссии
-    // Также блокируем, если идет переключение аккаунта
-    if (isWaitingForBalanceAndCommission || isSwitchingAccount) {
-      const reason = isSwitchingAccount ? 'переключение аккаунта' : 'обновление баланса и проверка комиссии';
+    // Также блокируем, если идет переключение аккаунта или таймаут между сделками
+    if (isWaitingForBalanceAndCommission || isSwitchingAccount || isWaitingForTradeTimeout) {
+      let reason = '';
+      if (isSwitchingAccount) {
+        reason = 'переключение аккаунта';
+      } else if (isWaitingForTradeTimeout) {
+        reason = `таймаут между сделками (isWaitingForTradeTimeout=${isWaitingForTradeTimeout})`;
+      } else {
+        reason = 'обновление баланса и проверка комиссии';
+      }
       console.log(`[SIGNAL] ⏳ Ожидаем ${reason} после закрытия позиции, игнорируем сигнал`);
       if (arbitrageStrategy) {
         arbitrageStrategy.clearSignal();
@@ -600,6 +635,22 @@ function setupHandlers() {
               // Помечаем аккаунт как error вручную, если stopTradingOnCurrentAccount не сработал
               currentAccount.status = 'error';
               currentAccount.stopReason = `Ошибка открытия позиции: ${errorMessage}`;
+              
+              // Сохраняем аккаунт в файл
+              try {
+                const lock = botLock.getBotLock();
+                if (lock.currentUserId && currentAccount) {
+                  const accountInConfig = multiAccountConfig.accounts.find(acc => acc.id === currentAccount!.id);
+                  if (accountInConfig) {
+                    accountInConfig.status = 'error';
+                    accountInConfig.stopReason = currentAccount.stopReason;
+                  }
+                  await flipUserData.saveUserAccounts(lock.currentUserId, multiAccountConfig.accounts);
+                  console.log(`[MULTI-ACCOUNT] ✅ Статус 'error' сохранен в файл для аккаунта ${currentAccount.id}`);
+                }
+              } catch (saveError) {
+                console.error('[MULTI-ACCOUNT] Ошибка сохранения статуса error в файл:', saveError);
+              }
             }
           }
           
@@ -654,7 +705,7 @@ async function openPosition(signal: any) {
     const contractDetail = await tradingHandler.getContractDetail(SYMBOL);
     if (contractDetail?.data) {
       contract = Array.isArray(contractDetail.data) 
-        ? contractDetail.data.find(c => c.symbol === SYMBOL) || contractDetail.data[0]
+        ? contractDetail.data.find((c: any) => c.symbol === SYMBOL) || contractDetail.data[0]
         : contractDetail.data;
       // Сохраняем в кэш
       contractCache = { symbol: SYMBOL, data: contract, timestamp: Date.now() };
@@ -1120,7 +1171,7 @@ async function closePosition(spreadData: any) {
       const contractDetail = await tradingHandler.getContractDetail(SYMBOL);
       if (contractDetail?.data) {
         const contract = Array.isArray(contractDetail.data) 
-          ? contractDetail.data.find(c => c.symbol === SYMBOL) || contractDetail.data[0]
+          ? contractDetail.data.find((c: any) => c.symbol === SYMBOL) || contractDetail.data[0]
           : contractDetail.data;
         priceScale = contract?.priceScale || 3;
         volScale = contract?.volScale || 0;
@@ -1269,15 +1320,40 @@ async function closePosition(spreadData: any) {
       }
       
       // Ждем завершения обновления баланса и проверки комиссии, затем снимаем блокировку
-      Promise.all([balanceUpdatePromise, commissionCheckPromise]).then(() => {
+      Promise.all([balanceUpdatePromise, commissionCheckPromise]).then(async () => {
         // ВАЖНО: Проверяем, что бот все еще запущен перед снятием блокировки
         // Если бот остановлен (например, при переключении аккаунтов), не снимаем блокировку
         // НО: если идет переключение аккаунта (isSwitchingAccount = true), блокировку снимать не нужно
         // она будет снята после успешного переключения в switchToNextAccount
         if (isRunning && !isSwitchingAccount) {
-          // Снимаем блокировку сразу после получения данных
+          // Снимаем блокировку обновления баланса/комиссии
           isWaitingForBalanceAndCommission = false;
-          console.log(`[TRADE] ✅ Баланс обновлен и комиссия проверена, разрешаем открытие новых позиций`);
+          console.log(`[TRADE] ✅ Баланс обновлен и комиссия проверена`);
+          
+          // ТАЙМАУТ МЕЖДУ СДЕЛКАМИ: Устанавливаем флаг и запускаем таймер после закрытия позиции
+          // ВАЖНО: Проверяем таймаут независимо от enabled, так как мультиаккаунтинг всегда включен
+          const timeoutSeconds = multiAccountConfig.tradeTimeoutSeconds || 0;
+          console.log(`[TRADE] 🔍 Проверка таймаута: tradeTimeoutSeconds=${multiAccountConfig.tradeTimeoutSeconds}, timeoutSeconds=${timeoutSeconds}, enabled=${multiAccountConfig.enabled}`);
+          
+          if (timeoutSeconds > 0) {
+            isWaitingForTradeTimeout = true;
+            const timeoutMs = timeoutSeconds * 1000;
+            console.log(`[TRADE] ⏳ Таймаут между сделками: ${timeoutSeconds} сек после закрытия позиции (флаг установлен: isWaitingForTradeTimeout=${isWaitingForTradeTimeout})`);
+            
+            setTimeout(() => {
+              if (isRunning && !isSwitchingAccount) {
+                isWaitingForTradeTimeout = false;
+                console.log(`[TRADE] ✅ Таймаут между сделками истек, разрешаем открытие новых позиций (флаг сброшен: isWaitingForTradeTimeout=${isWaitingForTradeTimeout})`);
+              } else {
+                // Если бот остановлен или идет переключение, сбрасываем флаг
+                isWaitingForTradeTimeout = false;
+                console.log(`[TRADE] ⚠️ Таймаут прерван: бот остановлен или идет переключение аккаунта (isRunning=${isRunning}, isSwitchingAccount=${isSwitchingAccount})`);
+              }
+            }, timeoutMs);
+          } else {
+            // Если таймаут не установлен, сразу разрешаем открытие новых позиций
+            console.log(`[TRADE] ✅ Таймаут не установлен (${timeoutSeconds} сек), разрешаем открытие новых позиций`);
+          }
         } else if (isSwitchingAccount) {
           console.log(`[TRADE] ⏳ Идет переключение аккаунта, блокировка будет снята после переключения`);
         } else {
@@ -1644,6 +1720,7 @@ app.get('/api/debug/state', (req, res) => {
   if (isSwitchingAccount) reasons.push('Идет переключение аккаунта');
   if (isTestingAccount) reasons.push('Идет тестирование аккаунта');
   if (isWaitingForBalanceAndCommission) reasons.push('Ожидание обновления баланса и проверки комиссии');
+  if (isWaitingForTradeTimeout) reasons.push('Таймаут между сделками');
   if (rateLimitBlockedUntil > now) reasons.push(`Rate limiting заблокирован еще ${Math.ceil((rateLimitBlockedUntil - now) / 1000)} сек`);
   
   res.json({
@@ -1652,6 +1729,7 @@ app.get('/api/debug/state', (req, res) => {
       isSwitchingAccount: isSwitchingAccount,
       isTestingAccount: isTestingAccount,
       isWaitingForBalanceAndCommission: isWaitingForBalanceAndCommission,
+      isWaitingForTradeTimeout: isWaitingForTradeTimeout,
       rateLimitBlockedUntil: rateLimitBlockedUntil,
       rateLimitBlocked: rateLimitBlockedUntil > now,
       rateLimitRemainingSeconds: rateLimitBlockedUntil > now ? Math.ceil((rateLimitBlockedUntil - now) / 1000) : 0
@@ -1691,6 +1769,7 @@ app.get('/api/debug/state', (req, res) => {
                        !isSwitchingAccount && 
                        !isTestingAccount && 
                        !isWaitingForBalanceAndCommission && 
+                       !isWaitingForTradeTimeout &&
                        rateLimitBlockedUntil <= now,
       reasons: reasons
     }
@@ -1702,12 +1781,92 @@ app.get('/api/spread', (req, res) => {
   res.json({ success: true, data: spread });
 });
 
-app.post('/api/start', async (req, res) => {
+app.post('/api/start', sharedAuth.requireAuth, async (req, res) => {
   try {
-    if (isRunning) {
-      return res.json({ success: false, error: 'Бот уже запущен' });
+    const userId = req.userId!;
+    
+    // Загружаем актуальную блокировку
+    await botLock.loadBotLock();
+    
+    // Проверяем блокировку
+    if (botLock.isBotLocked() && !botLock.isBotLockedByUser(userId)) {
+      // Бот занят другим пользователем
+      // Загружаем данные пользователя для очереди
+      const userData = await flipUserData.loadUserFlipData(userId);
+      
+      // Добавляем в очередь
+      const queuePosition = await botLock.addUserToQueue(
+        userId,
+        userData.config.accounts,
+        userData.settings || {
+          minTickDifference: 2,
+          positionSize: 100,
+          maxSlippagePercent: 0.1,
+          symbol: SYMBOL,
+          tickSize: 0.001,
+          autoLeverage: 10,
+          autoVolumeEnabled: false,
+          autoVolumePercent: 90,
+          autoVolumeMax: 3500,
+          marginMode: 'isolated',
+          minBalanceForTrading: 0.5
+        },
+        userData.config
+      );
+      
+      return res.json({
+        success: false,
+        queued: true,
+        message: `Бот занят пользователем: ${botLock.getBotLock().currentUsername}. Вы добавлены в очередь (позиция: ${queuePosition + 1})`,
+        queuePosition: queuePosition + 1
+      });
+    }
+    
+    if (isRunning && !botLock.isBotLockedByUser(userId)) {
+      return res.json({ success: false, error: 'Бот уже запущен другим пользователем' });
     }
 
+    // Захватываем блокировку
+    const lockAcquired = await botLock.acquireBotLock(userId);
+    if (!lockAcquired) {
+      return res.json({ success: false, error: 'Не удалось захватить блокировку бота' });
+    }
+    
+    // Загружаем данные пользователя
+    const userData = await flipUserData.loadUserFlipData(userId);
+    
+    // Применяем данные пользователя
+    if (userData.settings) {
+      // Применяем настройки
+      minTickDifference = userData.settings.minTickDifference;
+      arbitrageVolume = userData.settings.positionSize;
+      maxSlippagePercent = userData.settings.maxSlippagePercent;
+      SYMBOL = userData.settings.symbol || SYMBOL;
+      tickSize = userData.settings.tickSize || tickSize;
+      autoLeverage = userData.settings.autoLeverage;
+      autoVolumeEnabled = userData.settings.autoVolumeEnabled;
+      autoVolumePercent = userData.settings.autoVolumePercent;
+      autoVolumeMax = userData.settings.autoVolumeMax;
+      marginMode = (userData.settings.marginMode === 'isolated' || userData.settings.marginMode === 'cross') 
+        ? userData.settings.marginMode 
+        : 'isolated';
+      minBalanceForTrading = userData.settings.minBalanceForTrading;
+    }
+    
+    // Применяем конфигурацию мультиаккаунтинга
+    multiAccountConfig = userData.config || {
+      enabled: false,
+      accounts: [],
+      currentAccountIndex: -1,
+      targetBalance: 0,
+      maxTradingTimeMinutes: 0,
+      tradeTimeoutSeconds: 0
+    };
+    // Убеждаемся, что tradeTimeoutSeconds всегда определен
+    if (multiAccountConfig.tradeTimeoutSeconds === undefined || multiAccountConfig.tradeTimeoutSeconds === null) {
+      multiAccountConfig.tradeTimeoutSeconds = 0;
+    }
+    
     const { symbol } = req.body;
     
     // МУЛЬТИАККАУНТИНГ: Если включен, переключаемся на первый аккаунт
@@ -1778,13 +1937,25 @@ app.post('/api/start', async (req, res) => {
   }
 });
 
-app.post('/api/stop', async (req, res) => {
+app.post('/api/stop', sharedAuth.requireAuth, async (req, res) => {
   try {
+    const userId = req.userId!;
+    
     if (!isRunning) {
       return res.json({ success: false, error: 'Бот не запущен' });
     }
+    
+    // Проверяем, что бот запущен текущим пользователем
+    if (!botLock.isBotLockedByUser(userId)) {
+      return res.json({ success: false, error: 'Бот запущен другим пользователем' });
+    }
 
     console.log('[BOT] Остановка бота...');
+    
+    // Сохраняем данные пользователя перед остановкой
+    if (multiAccountConfig.enabled) {
+      await flipUserData.saveUserConfig(userId, multiAccountConfig);
+    }
     
     // МУЛЬТИАККАУНТИНГ: Останавливаем торговлю на текущем аккаунте
     if (multiAccountConfig.enabled && currentAccount) {
@@ -1822,6 +1993,9 @@ app.post('/api/stop', async (req, res) => {
     
     isRunning = false;
     currentSpread = null;
+    
+    // Освобождаем блокировку
+    await botLock.releaseBotLock('Ручная остановка пользователем');
     
     console.log('[BOT] ✓ Бот полностью остановлен');
     res.json({ success: true, message: 'Бот остановлен' });
@@ -2048,23 +2222,61 @@ async function calculateAutoVolume(): Promise<number> {
 }
 
 // Settings
-app.get('/api/settings', (req, res) => {
-  const config = arbitrageStrategy?.getConfig();
-  // Добавляем новые настройки в ответ
-  const response = {
-    ...config,
-    autoLeverage: autoLeverage,
-    autoVolumeEnabled: autoVolumeEnabled,
-    autoVolumePercent: autoVolumePercent,
-    autoVolumeMax: autoVolumeMax,
-    marginMode: marginMode,
-    minBalanceForTrading: minBalanceForTrading
-  };
-  res.json({ success: true, data: response });
+app.get('/api/settings', sharedAuth.requireAuth, async (req, res) => {
+  try {
+    const userId = req.userId!;
+    
+    // Загружаем настройки пользователя, если есть
+    const userSettings = await flipUserData.loadUserSettings(userId);
+    if (userSettings) {
+      // Применяем настройки пользователя
+      minTickDifference = userSettings.minTickDifference;
+      arbitrageVolume = userSettings.positionSize;
+      maxSlippagePercent = userSettings.maxSlippagePercent;
+      SYMBOL = userSettings.symbol || SYMBOL;
+      tickSize = userSettings.tickSize || tickSize;
+      autoLeverage = userSettings.autoLeverage;
+      autoVolumeEnabled = userSettings.autoVolumeEnabled;
+      autoVolumePercent = userSettings.autoVolumePercent;
+      autoVolumeMax = userSettings.autoVolumeMax;
+      marginMode = (userSettings.marginMode === 'isolated' || userSettings.marginMode === 'cross') 
+        ? userSettings.marginMode 
+        : 'isolated';
+      minBalanceForTrading = userSettings.minBalanceForTrading;
+      
+      // Обновляем стратегию
+      if (arbitrageStrategy) {
+        arbitrageStrategy.updateConfig({
+          minTickDifference,
+          positionSize: arbitrageVolume,
+          maxSlippagePercent,
+          symbol: SYMBOL,
+          tickSize
+        });
+      }
+    }
+    
+    const config = arbitrageStrategy?.getConfig();
+    // Добавляем новые настройки в ответ
+    const response = {
+      ...config,
+      autoLeverage: autoLeverage,
+      autoVolumeEnabled: autoVolumeEnabled,
+      autoVolumePercent: autoVolumePercent,
+      autoVolumeMax: autoVolumeMax,
+      marginMode: marginMode,
+      minBalanceForTrading: minBalanceForTrading,
+      symbol: SYMBOL // Добавляем символ в ответ
+    };
+    res.json({ success: true, data: response });
+  } catch (error: any) {
+    res.status(500).json({ success: false, error: error.message });
+  }
 });
 
-app.post('/api/settings', (req, res) => {
+app.post('/api/settings', sharedAuth.requireAuth, async (req, res) => {
   try {
+    const userId = req.userId!;
     const newConfig = req.body;
     
     // Обновляем новые настройки
@@ -2151,6 +2363,12 @@ app.post('/api/settings', (req, res) => {
       console.log(`[SETTINGS] Min balance for trading updated: ${minBalanceForTrading} USDT`);
     }
     
+    // Обновляем символ, если передан
+    if (newConfig.symbol !== undefined) {
+      SYMBOL = newConfig.symbol;
+      console.log(`[SETTINGS] Symbol updated: ${SYMBOL}`);
+    }
+    
     // Обновляем объем для арбитража, если он передан (только если автообъем выключен)
     if (newConfig.positionSize !== undefined && !autoVolumeEnabled) {
       arbitrageVolume = newConfig.positionSize;
@@ -2163,6 +2381,10 @@ app.post('/api/settings', (req, res) => {
     } else if (autoVolumeEnabled) {
       // Если автообъем включен, используем рассчитанный объем
       configToUpdate.positionSize = arbitrageVolume;
+    }
+    // Добавляем символ в конфигурацию стратегии
+    if (newConfig.symbol !== undefined) {
+      configToUpdate.symbol = SYMBOL;
     }
     
     arbitrageStrategy?.updateConfig(configToUpdate);
@@ -2178,6 +2400,55 @@ app.post('/api/settings', (req, res) => {
     console.log(`[SETTINGS]   - marginMode: ${marginMode} (openType: ${marginMode === 'isolated' ? 1 : 2})`);
     console.log(`[SETTINGS]   - minBalanceForTrading: ${minBalanceForTrading} USDT`);
     console.log(`[SETTINGS]   - arbitrageVolume: ${arbitrageVolume} USDT`);
+    console.log(`[SETTINGS]   - symbol: ${SYMBOL}`);
+    
+    // ВАЖНО: Сохраняем настройки пользователя в файл
+    const lock = botLock.getBotLock();
+    if (lock.currentUserId === userId && isRunning) {
+      // Бот запущен текущим пользователем - сохраняем актуальное состояние
+      const userSettings = {
+        minTickDifference: minTickDifference,
+        positionSize: arbitrageVolume,
+        maxSlippagePercent: maxSlippagePercent,
+        symbol: SYMBOL,
+        tickSize: tickSize,
+        autoLeverage: autoLeverage,
+        autoVolumeEnabled: autoVolumeEnabled,
+        autoVolumePercent: autoVolumePercent,
+        autoVolumeMax: autoVolumeMax,
+        marginMode: marginMode,
+        minBalanceForTrading: minBalanceForTrading
+      };
+      try {
+        await flipUserData.saveUserSettings(userId, userSettings);
+        console.log(`[SETTINGS] ✅ Настройки пользователя ${userId} сохранены в файл (бот активен)`);
+      } catch (error) {
+        console.error('[SETTINGS] Ошибка сохранения настроек пользователя:', error);
+      }
+    } else {
+      // Бот не запущен или запущен другим пользователем - сохраняем локально
+      const existingSettings = await flipUserData.loadUserSettings(userId);
+      const userSettings = {
+        ...existingSettings,
+        minTickDifference: newConfig.minTickDifference !== undefined ? newConfig.minTickDifference : (existingSettings?.minTickDifference || minTickDifference),
+        positionSize: arbitrageVolume,
+        maxSlippagePercent: newConfig.maxSlippagePercent !== undefined ? newConfig.maxSlippagePercent : (existingSettings?.maxSlippagePercent || maxSlippagePercent),
+        symbol: newConfig.symbol !== undefined ? newConfig.symbol : (existingSettings?.symbol || SYMBOL),
+        tickSize: newConfig.tickSize !== undefined ? newConfig.tickSize : (existingSettings?.tickSize || tickSize),
+        autoLeverage: autoLeverage,
+        autoVolumeEnabled: autoVolumeEnabled,
+        autoVolumePercent: autoVolumePercent,
+        autoVolumeMax: autoVolumeMax,
+        marginMode: marginMode,
+        minBalanceForTrading: minBalanceForTrading
+      };
+      try {
+        await flipUserData.saveUserSettings(userId, userSettings);
+        console.log(`[SETTINGS] ✅ Настройки пользователя ${userId} сохранены в файл (бот не активен)`);
+      } catch (error) {
+        console.error('[SETTINGS] Ошибка сохранения настроек пользователя:', error);
+      }
+    }
     
     res.json({ success: true, message: 'Настройки обновлены' });
   } catch (error: any) {
@@ -2436,6 +2707,7 @@ app.post('/api/server/restart', async (req, res) => {
     // КРИТИЧЕСКИ ВАЖНО: Сбрасываем флаги мультиаккаунтинга
     isSwitchingAccount = false;
     isWaitingForBalanceAndCommission = false;
+    isWaitingForTradeTimeout = false;
     pendingAccountSwitch = null;
     isTestingAccount = false;
     rateLimitBlockedUntil = 0;
@@ -2927,6 +3199,28 @@ async function stopTradingOnCurrentAccount(reason: string): Promise<void> {
   // Очищаем текущую позицию
   currentPosition = null;
   
+  // КРИТИЧЕСКИ ВАЖНО: Сохраняем аккаунты в файл после обновления статуса
+  try {
+    const lock = botLock.getBotLock();
+    if (lock.currentUserId && currentAccount) {
+      // Обновляем аккаунт в multiAccountConfig.accounts
+      const accountInConfig = multiAccountConfig.accounts.find(acc => acc.id === currentAccount!.id);
+      if (accountInConfig) {
+        accountInConfig.status = currentAccount.status;
+        accountInConfig.stopReason = currentAccount.stopReason;
+        accountInConfig.lastUpdateTime = currentAccount.lastUpdateTime;
+        accountInConfig.currentBalance = currentAccount.currentBalance;
+      }
+      
+      // Сохраняем аккаунты в файл
+      await flipUserData.saveUserAccounts(lock.currentUserId, multiAccountConfig.accounts);
+      console.log(`[MULTI-ACCOUNT] ✅ Статус аккаунта сохранен в файл: ${currentAccount.status}, причина: ${currentAccount.stopReason || 'нет'}`);
+    }
+  } catch (saveError) {
+    console.error('[MULTI-ACCOUNT] Ошибка сохранения статуса аккаунта в файл:', saveError);
+    // Не прерываем выполнение, так как это не критично
+  }
+  
   // КРИТИЧЕСКИ ВАЖНО: НЕ устанавливаем isRunning = false здесь!
   // Это останавливает весь бот, а не только торговлю на текущем аккаунте.
   // isRunning должен остаться true, чтобы бот мог переключиться на следующий аккаунт.
@@ -3065,6 +3359,22 @@ async function switchToAccount(accountId: string, reason: string = 'switch'): Pr
       account.status = 'error';
       account.stopReason = stopReason;
       
+      // Сохраняем аккаунт в файл
+      try {
+        const lock = botLock.getBotLock();
+        if (lock.currentUserId) {
+          const accountInConfig = multiAccountConfig.accounts.find(acc => acc.id === account.id);
+          if (accountInConfig) {
+            accountInConfig.status = 'error';
+            accountInConfig.stopReason = stopReason;
+          }
+          await flipUserData.saveUserAccounts(lock.currentUserId, multiAccountConfig.accounts);
+          console.log(`[MULTI-ACCOUNT] ✅ Статус 'error' сохранен в файл для аккаунта ${account.id}`);
+        }
+      } catch (saveError) {
+        console.error('[MULTI-ACCOUNT] Ошибка сохранения статуса error в файл:', saveError);
+      }
+      
       // Снимаем флаг переключения, чтобы switchToNextAccount мог работать
       isSwitchingAccount = false;
       // Вызываем switchToNextAccount, который теперь не выберет этот аккаунт
@@ -3181,8 +3491,16 @@ async function switchToAccount(accountId: string, reason: string = 'switch'): Pr
         }
         
         // КРИТИЧЕСКИ ВАЖНО: Блокируем открытие позиций до обновления баланса и проверки комиссии
-        if (isWaitingForBalanceAndCommission || isSwitchingAccount) {
-          const reason = isSwitchingAccount ? 'переключение аккаунта' : 'обновление баланса и проверка комиссии';
+        // Также блокируем, если идет переключение аккаунта или таймаут между сделками
+        if (isWaitingForBalanceAndCommission || isSwitchingAccount || isWaitingForTradeTimeout) {
+          let reason = '';
+          if (isSwitchingAccount) {
+            reason = 'переключение аккаунта';
+          } else if (isWaitingForTradeTimeout) {
+            reason = `таймаут между сделками (isWaitingForTradeTimeout=${isWaitingForTradeTimeout})`;
+          } else {
+            reason = 'обновление баланса и проверка комиссии';
+          }
           console.log(`[SIGNAL] ⏳ Ожидаем ${reason} после закрытия позиции, игнорируем сигнал`);
           if (arbitrageStrategy) {
             arbitrageStrategy.clearSignal();
@@ -3360,6 +3678,22 @@ async function switchToAccount(accountId: string, reason: string = 'switch'): Pr
                 // Помечаем аккаунт как error вручную, если stopTradingOnCurrentAccount не сработал
                 currentAccount.status = 'error';
                 currentAccount.stopReason = `Ошибка открытия позиции: ${errorMessage}`;
+                
+                // Сохраняем аккаунт в файл
+                try {
+                  const lock = botLock.getBotLock();
+                  if (lock.currentUserId && currentAccount) {
+                    const accountInConfig = multiAccountConfig.accounts.find(acc => acc.id === currentAccount!.id);
+                    if (accountInConfig) {
+                      accountInConfig.status = 'error';
+                      accountInConfig.stopReason = currentAccount.stopReason;
+                    }
+                    await flipUserData.saveUserAccounts(lock.currentUserId, multiAccountConfig.accounts);
+                    console.log(`[MULTI-ACCOUNT] ✅ Статус 'error' сохранен в файл для аккаунта ${currentAccount.id}`);
+                  }
+                } catch (saveError) {
+                  console.error('[MULTI-ACCOUNT] Ошибка сохранения статуса error в файл:', saveError);
+                }
               }
             }
             
@@ -3393,6 +3727,14 @@ async function switchToAccount(accountId: string, reason: string = 'switch'): Pr
               if (isRunning) {
                 isRunning = false;
                 console.log('[MULTI-ACCOUNT] ⚠️ Торговля остановлена из-за ошибки переключения');
+                
+                // КРИТИЧЕСКИ ВАЖНО: Освобождаем блокировку бота
+                try {
+                  await botLock.releaseBotLock('Ошибка переключения аккаунта');
+                  console.log('[MULTI-ACCOUNT] ✅ Блокировка бота освобождена');
+                } catch (error) {
+                  console.error('[MULTI-ACCOUNT] Ошибка освобождения блокировки:', error);
+                }
               }
             }
           } else {
@@ -3440,6 +3782,7 @@ async function switchToAccount(accountId: string, reason: string = 'switch'): Pr
     // Снимаем флаги блокировки после успешного переключения и задержки
     isSwitchingAccount = false;
     isWaitingForBalanceAndCommission = false; // Снимаем блокировку обновления баланса/комиссии
+    isWaitingForTradeTimeout = false; // Снимаем блокировку таймаута между сделками
     console.log(`[MULTI-ACCOUNT] ✅ Флаги блокировки сняты, торговля на аккаунте "${account.name || account.id}" готова к работе`);
     
     return true;
@@ -3449,6 +3792,22 @@ async function switchToAccount(accountId: string, reason: string = 'switch'): Pr
       currentAccount.status = 'error';
       currentAccount.stopReason = `Ошибка переключения: ${error.message}`;
       logMultiAccount('error', currentAccount, `Ошибка переключения: ${error.message}`);
+      
+      // Сохраняем аккаунт в файл
+      try {
+        const lock = botLock.getBotLock();
+        if (lock.currentUserId && currentAccount) {
+          const accountInConfig = multiAccountConfig.accounts.find(acc => acc.id === currentAccount!.id);
+          if (accountInConfig) {
+            accountInConfig.status = 'error';
+            accountInConfig.stopReason = currentAccount.stopReason;
+          }
+          await flipUserData.saveUserAccounts(lock.currentUserId, multiAccountConfig.accounts);
+          console.log(`[MULTI-ACCOUNT] ✅ Статус 'error' сохранен в файл для аккаунта ${currentAccount.id}`);
+        }
+      } catch (saveError) {
+        console.error('[MULTI-ACCOUNT] Ошибка сохранения статуса error в файл:', saveError);
+      }
     }
     // Снимаем флаг блокировки даже при ошибке
     isSwitchingAccount = false;
@@ -3511,6 +3870,15 @@ async function switchToNextAccount(reason: string): Promise<boolean> {
           arbitrageStrategy.clearSignal();
         }
         currentPosition = null;
+        
+        // КРИТИЧЕСКИ ВАЖНО: Освобождаем блокировку бота
+        try {
+          await botLock.releaseBotLock('Единственный аккаунт завершил торговлю');
+          console.log('[MULTI-ACCOUNT] ✅ Блокировка бота освобождена');
+        } catch (error) {
+          console.error('[MULTI-ACCOUNT] Ошибка освобождения блокировки:', error);
+        }
+        
         console.log('[MULTI-ACCOUNT] ✅ Бот полностью остановлен (вебсокеты отключены)');
       }
       return false;
@@ -3535,20 +3903,109 @@ async function switchToNextAccount(reason: string): Promise<boolean> {
     );
     
     if (allAccountsTraded) {
-      console.log('[MULTI-ACCOUNT] ✅ Все аккаунты проторгованы, останавливаем бота');
+      console.log('[MULTI-ACCOUNT] ✅ Все аккаунты текущего пользователя проторгованы');
+      
+      // Сохраняем данные текущего пользователя
+      const currentUserId = botLock.getBotLock().currentUserId;
+      if (currentUserId) {
+        try {
+          await flipUserData.saveUserConfig(currentUserId, multiAccountConfig);
+          console.log('[BOT-QUEUE] ✅ Данные пользователя сохранены');
+        } catch (error) {
+          console.error('[BOT-QUEUE] Ошибка сохранения данных пользователя:', error);
+        }
+      }
+      
+      // Освобождаем блокировку текущего пользователя
+      await botLock.releaseBotLock('Все аккаунты проторгованы');
+      
+      // Проверяем очередь
+      const nextUser = await botLock.shiftQueue();
+      
+      if (nextUser) {
+        console.log(`[BOT-QUEUE] 🔄 Переключаемся на пользователя: ${nextUser.username}`);
+        
+        // Загружаем данные следующего пользователя
+        multiAccountConfig = nextUser.config || {
+          enabled: false,
+          accounts: [],
+          currentAccountIndex: -1,
+          targetBalance: 0,
+          maxTradingTimeMinutes: 0,
+          tradeTimeoutSeconds: 0
+        };
+        // Убеждаемся, что tradeTimeoutSeconds всегда определен
+        if (multiAccountConfig.tradeTimeoutSeconds === undefined || multiAccountConfig.tradeTimeoutSeconds === null) {
+          multiAccountConfig.tradeTimeoutSeconds = 0;
+        }
+        
+        // Применяем настройки следующего пользователя
+        if (nextUser.settings) {
+          minTickDifference = nextUser.settings.minTickDifference;
+          arbitrageVolume = nextUser.settings.positionSize;
+          maxSlippagePercent = nextUser.settings.maxSlippagePercent;
+          SYMBOL = nextUser.settings.symbol || SYMBOL;
+          tickSize = nextUser.settings.tickSize || tickSize;
+          autoLeverage = nextUser.settings.autoLeverage;
+          autoVolumeEnabled = nextUser.settings.autoVolumeEnabled;
+          autoVolumePercent = nextUser.settings.autoVolumePercent;
+          autoVolumeMax = nextUser.settings.autoVolumeMax;
+          marginMode = (nextUser.settings.marginMode === 'isolated' || nextUser.settings.marginMode === 'cross') 
+            ? nextUser.settings.marginMode 
+            : 'isolated';
+          minBalanceForTrading = nextUser.settings.minBalanceForTrading;
+        }
+        
+        // Захватываем блокировку для нового пользователя
+        await botLock.acquireBotLock(nextUser.userId);
+        
+        // Переключаемся на первый аккаунт нового пользователя
+        if (multiAccountConfig.accounts.length > 0) {
+          const firstAccount = multiAccountConfig.accounts.find(acc => acc.status !== 'error' && acc.status !== 'stopped') || multiAccountConfig.accounts[0];
+          if (firstAccount) {
+            await switchToAccount(firstAccount.id, 'Автоматический переход к следующему пользователю');
+            return true; // Продолжаем торговлю
+          }
+        }
+      }
+      
+      // Если очередь пуста, останавливаем бота
+      console.log('[BOT-QUEUE] ✅ Очередь пуста, останавливаем бота');
       if (isRunning) {
         isRunning = false;
+        
+        // КРИТИЧЕСКИ ВАЖНО: Освобождаем блокировку бота
+        try {
+          await botLock.releaseBotLock('Очередь пуста');
+          console.log('[BOT-QUEUE] ✅ Блокировка бота освобождена');
+        } catch (error) {
+          console.error('[BOT-QUEUE] Ошибка освобождения блокировки:', error);
+        }
+        
         // Останавливаем обработчики
         if (binanceWS) {
           binanceWS.onPriceUpdate = undefined;
+          binanceWS.onError = undefined;
+          binanceWS.onConnect = undefined;
+          binanceWS.onDisconnect = undefined;
+          binanceWS.disconnect();
         }
         if (mexcWS) {
           mexcWS.onPriceUpdate = undefined;
           mexcWS.onOrderbookUpdate = undefined;
+          mexcWS.onError = undefined;
+          mexcWS.onConnect = undefined;
+          mexcWS.onDisconnect = undefined;
+          mexcWS.disconnect();
         }
         if (priceMonitor) {
           priceMonitor.onSpreadUpdate = undefined;
         }
+        if (arbitrageStrategy) {
+          arbitrageStrategy.onSignal = undefined;
+          arbitrageStrategy.clearSignal();
+        }
+        currentPosition = null;
       }
       return false;
     }
@@ -3660,7 +4117,74 @@ async function switchToNextAccount(reason: string): Promise<boolean> {
         // КРИТИЧЕСКИ ВАЖНО: Останавливаем бота ТОЛЬКО если все аккаунты проторгованы
         // Используем обновленное значение после остановки текущего аккаунта
         if (allAccountsTradedAfterStop) {
-          console.log('[MULTI-ACCOUNT] ✅ Все аккаунты проторгованы (после остановки текущего), останавливаем бота');
+          console.log('[MULTI-ACCOUNT] ✅ Все аккаунты текущего пользователя проторгованы (после остановки текущего)');
+          
+          // Сохраняем данные текущего пользователя
+          const currentUserId = botLock.getBotLock().currentUserId;
+          if (currentUserId) {
+            try {
+              await flipUserData.saveUserConfig(currentUserId, multiAccountConfig);
+              console.log('[BOT-QUEUE] ✅ Данные пользователя сохранены');
+            } catch (error) {
+              console.error('[BOT-QUEUE] Ошибка сохранения данных пользователя:', error);
+            }
+          }
+          
+          // Освобождаем блокировку текущего пользователя
+          await botLock.releaseBotLock('Все аккаунты проторгованы');
+          
+          // Проверяем очередь
+          const nextUser = await botLock.shiftQueue();
+          
+          if (nextUser) {
+            console.log(`[BOT-QUEUE] 🔄 Переключаемся на пользователя: ${nextUser.username}`);
+            
+            // Загружаем данные следующего пользователя
+            multiAccountConfig = nextUser.config || {
+              enabled: false,
+              accounts: [],
+              currentAccountIndex: -1,
+              targetBalance: 0,
+              maxTradingTimeMinutes: 0,
+              tradeTimeoutSeconds: 0
+            };
+            // Убеждаемся, что tradeTimeoutSeconds всегда определен
+            if (multiAccountConfig.tradeTimeoutSeconds === undefined || multiAccountConfig.tradeTimeoutSeconds === null) {
+              multiAccountConfig.tradeTimeoutSeconds = 0;
+            }
+            
+            // Применяем настройки следующего пользователя
+            if (nextUser.settings) {
+              minTickDifference = nextUser.settings.minTickDifference;
+              arbitrageVolume = nextUser.settings.positionSize;
+              maxSlippagePercent = nextUser.settings.maxSlippagePercent;
+              SYMBOL = nextUser.settings.symbol || SYMBOL;
+              tickSize = nextUser.settings.tickSize || tickSize;
+              autoLeverage = nextUser.settings.autoLeverage;
+              autoVolumeEnabled = nextUser.settings.autoVolumeEnabled;
+              autoVolumePercent = nextUser.settings.autoVolumePercent;
+              autoVolumeMax = nextUser.settings.autoVolumeMax;
+              marginMode = (nextUser.settings.marginMode === 'isolated' || nextUser.settings.marginMode === 'cross') 
+            ? nextUser.settings.marginMode 
+            : 'isolated';
+              minBalanceForTrading = nextUser.settings.minBalanceForTrading;
+            }
+            
+            // Захватываем блокировку для нового пользователя
+            await botLock.acquireBotLock(nextUser.userId);
+            
+            // Переключаемся на первый аккаунт нового пользователя
+            if (multiAccountConfig.accounts.length > 0) {
+              const firstAccount = multiAccountConfig.accounts.find(acc => acc.status !== 'error' && acc.status !== 'stopped') || multiAccountConfig.accounts[0];
+              if (firstAccount) {
+                await switchToAccount(firstAccount.id, 'Автоматический переход к следующему пользователю');
+                return true; // Продолжаем торговлю
+              }
+            }
+          }
+          
+          // Если очередь пуста, останавливаем бота
+          console.log('[BOT-QUEUE] ✅ Очередь пуста, останавливаем бота');
           if (isRunning) {
             isRunning = false;
             
@@ -3772,6 +4296,15 @@ async function switchToNextAccount(reason: string): Promise<boolean> {
               arbitrageStrategy.clearSignal();
             }
             currentPosition = null;
+            
+            // КРИТИЧЕСКИ ВАЖНО: Освобождаем блокировку бота
+            try {
+              await botLock.releaseBotLock('Все аккаунты проторгованы');
+              console.log('[MULTI-ACCOUNT] ✅ Блокировка бота освобождена');
+            } catch (error) {
+              console.error('[MULTI-ACCOUNT] Ошибка освобождения блокировки:', error);
+            }
+            
             console.log('[MULTI-ACCOUNT] ✅ Бот полностью остановлен (вебсокеты отключены)');
             
             // Используем оригинальную причину из параметра reason, если она есть
@@ -3796,6 +4329,14 @@ async function switchToNextAccount(reason: string): Promise<boolean> {
       if (isRunning) {
         console.log('[MULTI-ACCOUNT] 🛑 Останавливаем торговлю (isRunning = false)');
         isRunning = false;
+        
+        // КРИТИЧЕСКИ ВАЖНО: Освобождаем блокировку бота
+        try {
+          await botLock.releaseBotLock('Все аккаунты проторгованы');
+          console.log('[MULTI-ACCOUNT] ✅ Блокировка бота освобождена');
+        } catch (error) {
+          console.error('[MULTI-ACCOUNT] Ошибка освобождения блокировки:', error);
+        }
         
         // КРИТИЧЕСКИ ВАЖНО: Проверяем и закрываем все открытые позиции перед остановкой
         if (currentPosition || (tradingHandler.getClient() && currentAccount)) {
@@ -3996,57 +4537,133 @@ async function checkAccountSwitchConditions(): Promise<void> {
 // ==================== МУЛЬТИАККАУНТИНГ: API ENDPOINTS ====================
 
 // Получить конфигурацию мультиаккаунтинга
-app.get('/api/multi-account/config', (req, res) => {
+app.get('/api/multi-account/config', sharedAuth.requireAuth, async (req, res) => {
   try {
-    // Возвращаем конфигурацию без секретных данных
-    const safeConfig = {
-      enabled: multiAccountConfig.enabled,
-      targetBalance: multiAccountConfig.targetBalance,
-      maxTradingTimeMinutes: multiAccountConfig.maxTradingTimeMinutes,
-      currentAccountIndex: multiAccountConfig.currentAccountIndex,
-      accountsCount: multiAccountConfig.accounts.length
-    };
+    const userId = req.userId!;
+    console.log(`[MULTI-ACCOUNT] GET /api/multi-account/config - запрос от пользователя ${userId}`);
     
-    res.json({ success: true, data: safeConfig });
+    // Загружаем конфигурацию пользователя из файла
+    const userConfig = await flipUserData.loadUserConfig(userId);
+    console.log(`[MULTI-ACCOUNT] Загружена конфигурация пользователя из файла:`, userConfig);
+    
+    // Если бот запущен текущим пользователем, используем актуальное состояние из памяти
+    const lock = botLock.getBotLock();
+    if (lock.currentUserId === userId && isRunning) {
+      // Возвращаем текущую конфигурацию из памяти
+      const safeConfig = {
+        enabled: multiAccountConfig.enabled,
+        targetBalance: multiAccountConfig.targetBalance,
+        maxTradingTimeMinutes: multiAccountConfig.maxTradingTimeMinutes,
+        tradeTimeoutSeconds: multiAccountConfig.tradeTimeoutSeconds || 0,
+        currentAccountIndex: multiAccountConfig.currentAccountIndex,
+        accountsCount: multiAccountConfig.accounts.length
+      };
+      console.log(`[MULTI-ACCOUNT] Возвращаем конфигурацию из памяти (бот активен):`, safeConfig);
+      res.json({ success: true, data: safeConfig });
+    } else {
+      // Возвращаем сохраненную конфигурацию пользователя из файла
+      const safeConfig = {
+        enabled: userConfig?.enabled || false,
+        targetBalance: userConfig?.targetBalance || 0,
+        maxTradingTimeMinutes: userConfig?.maxTradingTimeMinutes || 0,
+        tradeTimeoutSeconds: userConfig?.tradeTimeoutSeconds || 0,
+        currentAccountIndex: userConfig?.currentAccountIndex || -1,
+        accountsCount: userConfig?.accounts?.length || 0
+      };
+      console.log(`[MULTI-ACCOUNT] Возвращаем конфигурацию из файла (бот не активен):`, safeConfig);
+      res.json({ success: true, data: safeConfig });
+    }
   } catch (error: any) {
+    console.error(`[MULTI-ACCOUNT] Ошибка загрузки конфигурации:`, error);
     res.status(500).json({ success: false, error: error.message });
   }
 });
 
 // Обновить конфигурацию мультиаккаунтинга
-app.post('/api/multi-account/config', (req, res) => {
+app.post('/api/multi-account/config', sharedAuth.requireAuth, async (req, res) => {
   try {
-    console.log('[MULTI-ACCOUNT] POST /api/multi-account/config - запрос получен');
-    const { enabled, targetBalance, maxTradingTimeMinutes } = req.body;
+    const userId = req.userId!;
+    console.log('[MULTI-ACCOUNT] POST /api/multi-account/config - запрос получен от пользователя', userId);
+    const { enabled, targetBalance, maxTradingTimeMinutes, tradeTimeoutSeconds } = req.body;
+    console.log('[MULTI-ACCOUNT] Данные запроса:', { enabled, targetBalance, maxTradingTimeMinutes, tradeTimeoutSeconds });
     
-    if (enabled !== undefined) {
-      multiAccountConfig.enabled = Boolean(enabled);
+    // Загружаем текущую конфигурацию пользователя из файла
+    const userConfig = await flipUserData.loadUserConfig(userId);
+    console.log('[MULTI-ACCOUNT] Текущая конфигурация пользователя из файла:', userConfig);
+    
+    // Обновляем конфигурацию
+    const updatedConfig = {
+      ...userConfig,
+      enabled: enabled !== undefined ? Boolean(enabled) : (userConfig?.enabled || true),
+      targetBalance: targetBalance !== undefined ? parseFloat(String(targetBalance)) || 0 : (userConfig?.targetBalance || 0),
+      maxTradingTimeMinutes: maxTradingTimeMinutes !== undefined ? parseInt(String(maxTradingTimeMinutes)) || 0 : (userConfig?.maxTradingTimeMinutes || 0),
+      tradeTimeoutSeconds: tradeTimeoutSeconds !== undefined ? parseFloat(String(tradeTimeoutSeconds)) || 0 : (userConfig?.tradeTimeoutSeconds || 0),
+      accounts: userConfig?.accounts || [],
+      currentAccountIndex: userConfig?.currentAccountIndex || -1
+    };
+    
+    console.log(`[MULTI-ACCOUNT] Обновленная конфигурация:`, updatedConfig);
+    
+    // Если бот запущен текущим пользователем, также обновляем конфигурацию в памяти
+    const lock = botLock.getBotLock();
+    if (lock.currentUserId === userId && isRunning) {
+      multiAccountConfig.enabled = updatedConfig.enabled;
+      multiAccountConfig.targetBalance = updatedConfig.targetBalance;
+      multiAccountConfig.maxTradingTimeMinutes = updatedConfig.maxTradingTimeMinutes;
+      multiAccountConfig.tradeTimeoutSeconds = updatedConfig.tradeTimeoutSeconds;
+      console.log('[MULTI-ACCOUNT] Конфигурация обновлена в памяти (бот активен)');
     }
     
-    if (targetBalance !== undefined) {
-      multiAccountConfig.targetBalance = parseFloat(String(targetBalance)) || 0;
+    // Сохраняем конфигурацию пользователя в файл
+    try {
+      await flipUserData.saveUserConfig(userId, updatedConfig);
+      console.log('[MULTI-ACCOUNT] ✅ Конфигурация пользователя сохранена в файл');
+    } catch (error) {
+      console.error('[MULTI-ACCOUNT] Ошибка сохранения конфигурации пользователя:', error);
     }
     
-    if (maxTradingTimeMinutes !== undefined) {
-      multiAccountConfig.maxTradingTimeMinutes = parseInt(String(maxTradingTimeMinutes)) || 0;
-    }
-    
-    console.log(`[MULTI-ACCOUNT] Конфигурация обновлена:`, {
-      enabled: multiAccountConfig.enabled,
-      targetBalance: multiAccountConfig.targetBalance,
-      maxTradingTimeMinutes: multiAccountConfig.maxTradingTimeMinutes
-    });
-    
-    res.json({ success: true, message: 'Конфигурация обновлена', data: multiAccountConfig });
+    res.json({ success: true, message: 'Конфигурация обновлена', data: updatedConfig });
   } catch (error: any) {
+    console.error('[MULTI-ACCOUNT] Ошибка обновления конфигурации:', error);
     res.status(500).json({ success: false, error: error.message });
   }
 });
 
 // Получить список аккаунтов (без секретных данных)
-app.get('/api/multi-account/accounts', (req, res) => {
+app.get('/api/multi-account/accounts', sharedAuth.requireAuth, async (req, res) => {
   try {
-    const safeAccounts = multiAccountConfig.accounts.map(acc => {
+    const userId = req.userId!;
+    console.log(`[MULTI-ACCOUNT] GET /api/multi-account/accounts - запрос от пользователя ${userId}`);
+    
+    // Загружаем аккаунты пользователя из файла
+    const userAccounts = await flipUserData.loadUserAccounts(userId);
+    console.log(`[MULTI-ACCOUNT] Загружено аккаунтов из файла для пользователя ${userId}: ${userAccounts?.length || 0}`);
+    
+    // Если бот запущен текущим пользователем, синхронизируем состояние
+    const lock = botLock.getBotLock();
+    let accountsToReturn = userAccounts || [];
+    
+    if (lock.currentUserId === userId && isRunning) {
+      // Бот запущен - используем аккаунты из памяти (актуальное состояние)
+      // Но также синхронизируем с файлом, чтобы не потерять данные
+      if (multiAccountConfig.accounts.length > 0) {
+        accountsToReturn = multiAccountConfig.accounts;
+        // Синхронизируем файл с актуальным состоянием
+        await flipUserData.saveUserAccounts(userId, accountsToReturn);
+        console.log(`[MULTI-ACCOUNT] Используются аккаунты из памяти (${accountsToReturn.length} шт.), файл синхронизирован`);
+      } else if (userAccounts.length > 0) {
+        // Если в памяти нет аккаунтов, но в файле есть - загружаем из файла
+        accountsToReturn = userAccounts;
+        multiAccountConfig.accounts = userAccounts;
+        console.log(`[MULTI-ACCOUNT] Аккаунты загружены из файла в память (${accountsToReturn.length} шт.)`);
+      }
+    } else {
+      // Бот не запущен - используем аккаунты из файла
+      accountsToReturn = userAccounts || [];
+      console.log(`[MULTI-ACCOUNT] Используются аккаунты из файла (${accountsToReturn.length} шт.), бот не активен`);
+    }
+    
+    const safeAccounts = accountsToReturn.map(acc => {
       const apiKeyStart = acc.apiKey.substring(0, 4);
       const apiKeyEnd = acc.apiKey.length > 8 ? acc.apiKey.substring(acc.apiKey.length - 4) : '';
       const apiKeyPreview = acc.apiKey.length > 8 ? `${apiKeyStart}...${apiKeyEnd}` : `${apiKeyStart}...`;
@@ -4061,7 +4678,7 @@ app.get('/api/multi-account/accounts', (req, res) => {
       
       return {
         id: acc.id,
-        name: acc.name || `Аккаунт ${multiAccountConfig.accounts.indexOf(acc) + 1}`,
+        name: acc.name || `Аккаунт ${accountsToReturn.indexOf(acc) + 1}`,
         apiKeyPreview,
         apiSecretPreview,
         webTokenPreview,
@@ -4085,8 +4702,9 @@ app.get('/api/multi-account/accounts', (req, res) => {
 });
 
 // Добавить новый аккаунт
-app.post('/api/multi-account/accounts', async (req, res) => {
+app.post('/api/multi-account/accounts', sharedAuth.requireAuth, async (req, res) => {
   try {
+    const userId = req.userId!;
     console.log('[MULTI-ACCOUNT] POST /api/multi-account/accounts - запрос получен');
     const { apiKey, apiSecret, webToken, name } = req.body;
     
@@ -4142,7 +4760,42 @@ app.post('/api/multi-account/accounts', async (req, res) => {
     // Текущая торговля продолжается на том же аккаунте
     
     logMultiAccount('check', newAccount, 'Аккаунт добавлен и проверен');
-    console.log(`[MULTI-ACCOUNT] ✅ Аккаунт "${newAccount.name || newAccount.id}" добавлен в очередь. Текущий активный аккаунт: ${currentAccount ? `"${currentAccount.name || currentAccount.id}" (индекс ${multiAccountConfig.currentAccountIndex})` : 'нет'}`);
+    console.log(`[MULTI-ACCOUNT] ✅ Аккаунт "${newAccount.name || newAccount.id}" добавлен. Текущий активный аккаунт: ${currentAccount ? `"${currentAccount.name || currentAccount.id}" (индекс ${multiAccountConfig.currentAccountIndex})` : 'нет'}`);
+    
+    // ВАЖНО: Сохраняем аккаунты пользователя ВСЕГДА, независимо от состояния бота
+    const botLockState = botLock.getBotLock();
+    if (botLockState.currentUserId === userId && isRunning) {
+      // Бот запущен текущим пользователем - сохраняем актуальное состояние
+      try {
+        await flipUserData.saveUserAccounts(userId, multiAccountConfig.accounts);
+        await flipUserData.saveUserConfig(userId, multiAccountConfig);
+        console.log(`[MULTI-ACCOUNT] ✅ Данные пользователя ${userId} сохранены (бот активен)`);
+      } catch (error) {
+        console.error('[MULTI-ACCOUNT] Ошибка сохранения аккаунтов пользователя:', error);
+      }
+    } else {
+      // Бот не запущен или запущен другим пользователем - сохраняем локально
+      const userConfig = await flipUserData.loadUserConfig(userId);
+      const userAccounts = await flipUserData.loadUserAccounts(userId);
+      
+      // Добавляем новый аккаунт к существующим
+      const updatedAccounts = [...(userAccounts || []), newAccount];
+      const updatedConfig = {
+        enabled: userConfig?.enabled || false,
+        accounts: updatedAccounts,
+        currentAccountIndex: userConfig?.currentAccountIndex || -1,
+        targetBalance: userConfig?.targetBalance || 0,
+        maxTradingTimeMinutes: userConfig?.maxTradingTimeMinutes || 0
+      };
+      
+      try {
+        await flipUserData.saveUserAccounts(userId, updatedAccounts);
+        await flipUserData.saveUserConfig(userId, updatedConfig);
+        console.log(`[MULTI-ACCOUNT] ✅ Данные пользователя ${userId} сохранены (бот не активен)`);
+      } catch (error) {
+        console.error('[MULTI-ACCOUNT] Ошибка сохранения аккаунтов пользователя:', error);
+      }
+    }
     
     // ВАЖНО: Если бот остановлен и мультиаккаунтинг включен, проверяем, можно ли продолжить торговлю
     // Это может произойти, если бот остановился из-за отсутствия доступных аккаунтов
@@ -4191,8 +4844,9 @@ app.post('/api/multi-account/accounts', async (req, res) => {
 });
 
 // Обновить аккаунт
-app.put('/api/multi-account/accounts/:id', async (req, res) => {
+app.put('/api/multi-account/accounts/:id', sharedAuth.requireAuth, async (req, res) => {
   try {
+    const userId = req.userId!;
     const { id } = req.params;
     const { apiKey, apiSecret, webToken, name } = req.body;
     
@@ -4237,6 +4891,14 @@ app.put('/api/multi-account/accounts/:id', async (req, res) => {
     const webTokenEnd = account.webToken.length > 8 ? account.webToken.substring(account.webToken.length - 4) : '';
     const webTokenPreview = account.webToken.length > 8 ? `${webTokenStart}...${webTokenEnd}` : `${webTokenStart}...`;
     
+    // Сохраняем аккаунты пользователя
+    try {
+      await flipUserData.saveUserAccounts(userId, multiAccountConfig.accounts);
+      await flipUserData.saveUserConfig(userId, multiAccountConfig);
+    } catch (error) {
+      console.error('[MULTI-ACCOUNT] Ошибка сохранения аккаунтов пользователя:', error);
+    }
+    
     res.json({ 
       success: true, 
       message: 'Аккаунт успешно обновлен и проверен',
@@ -4256,64 +4918,98 @@ app.put('/api/multi-account/accounts/:id', async (req, res) => {
 });
 
 // Удалить аккаунт
-app.delete('/api/multi-account/accounts/:id', (req, res) => {
+app.delete('/api/multi-account/accounts/:id', sharedAuth.requireAuth, async (req, res) => {
   try {
+    const userId = req.userId!;
     const { id } = req.params;
+    console.log(`[MULTI-ACCOUNT] DELETE /api/multi-account/accounts/${id} - запрос от пользователя ${userId}`);
     
-    const accountIndex = multiAccountConfig.accounts.findIndex(acc => acc.id === id);
+    // Загружаем аккаунты пользователя из файла
+    const userAccounts = await flipUserData.loadUserAccounts(userId);
+    const accountIndex = userAccounts.findIndex(acc => acc.id === id);
+    
     if (accountIndex === -1) {
+      // Проверяем также в памяти, если бот запущен
+      const lock = botLock.getBotLock();
+      if (lock.currentUserId === userId && isRunning) {
+        const memoryIndex = multiAccountConfig.accounts.findIndex(acc => acc.id === id);
+        if (memoryIndex === -1) {
+          return res.status(404).json({ success: false, error: 'Аккаунт не найден' });
+        }
+        
+        // Нельзя удалить аккаунт, если он сейчас активен
+        if (multiAccountConfig.currentAccountIndex === memoryIndex && isRunning) {
+          return res.status(400).json({ 
+            success: false, 
+            error: 'Нельзя удалить активный аккаунт. Сначала остановите торговлю.' 
+          });
+        }
+        
+        // Удаляем аккаунт из памяти
+        multiAccountConfig.accounts.splice(memoryIndex, 1);
+        
+        // Обновляем индекс текущего аккаунта
+        if (multiAccountConfig.currentAccountIndex >= memoryIndex) {
+          multiAccountConfig.currentAccountIndex--;
+        }
+        
+        // Сохраняем в файл
+        await flipUserData.saveUserAccounts(userId, multiAccountConfig.accounts);
+        await flipUserData.saveUserConfig(userId, multiAccountConfig);
+        
+        console.log(`[MULTI-ACCOUNT] ✅ Аккаунт ${id} удален из памяти и файла (бот активен)`);
+        return res.json({ success: true, message: 'Аккаунт успешно удален' });
+      }
+      
       return res.status(404).json({ success: false, error: 'Аккаунт не найден' });
     }
     
-    const account = multiAccountConfig.accounts[accountIndex];
+    // Удаляем аккаунт из файла
+    userAccounts.splice(accountIndex, 1);
     
-    // Нельзя удалить аккаунт, если он сейчас активен
-    if (multiAccountConfig.currentAccountIndex === accountIndex && isRunning) {
-      return res.status(400).json({ 
-        success: false, 
-        error: 'Нельзя удалить активный аккаунт. Сначала остановите торговлю.' 
-      });
-    }
-    
-    // Удаляем аккаунт
-    multiAccountConfig.accounts.splice(accountIndex, 1);
-    
-    // Обновляем индекс текущего аккаунта
-    if (multiAccountConfig.currentAccountIndex >= accountIndex) {
-      multiAccountConfig.currentAccountIndex--;
-    }
-    
-    // ВАЖНО: Если удаленный аккаунт был текущим (но торговля остановлена), обновляем ссылку
-    if (currentAccount && currentAccount.id === id) {
-      // Если торговля остановлена, очищаем текущий аккаунт
-      if (!isRunning) {
-        currentAccount = null;
-        multiAccountConfig.currentAccountIndex = -1;
+    // Если бот запущен текущим пользователем, также обновляем память
+    const lock = botLock.getBotLock();
+    if (lock.currentUserId === userId && isRunning) {
+      const memoryIndex = multiAccountConfig.accounts.findIndex(acc => acc.id === id);
+      if (memoryIndex !== -1) {
+        // Нельзя удалить аккаунт, если он сейчас активен
+        if (multiAccountConfig.currentAccountIndex === memoryIndex && isRunning) {
+          return res.status(400).json({ 
+            success: false, 
+            error: 'Нельзя удалить активный аккаунт. Сначала остановите торговлю.' 
+          });
+        }
+        
+        // Удаляем аккаунт из памяти
+        multiAccountConfig.accounts.splice(memoryIndex, 1);
+        
+        // Обновляем индекс текущего аккаунта
+        if (multiAccountConfig.currentAccountIndex >= memoryIndex) {
+          multiAccountConfig.currentAccountIndex--;
+        }
       }
-    }
-    
-    // ВАЖНО: Проверяем валидность currentAccountIndex после удаления
-    if (multiAccountConfig.currentAccountIndex >= 0 && 
-        multiAccountConfig.currentAccountIndex >= multiAccountConfig.accounts.length) {
-      // Индекс вышел за границы массива, сбрасываем его
-      multiAccountConfig.currentAccountIndex = -1;
-      if (!isRunning) {
-        currentAccount = null;
+      
+      // Сохраняем в файл и конфигурацию
+      await flipUserData.saveUserAccounts(userId, userAccounts);
+      await flipUserData.saveUserConfig(userId, multiAccountConfig);
+      console.log(`[MULTI-ACCOUNT] ✅ Аккаунт ${id} удален из памяти и файла (бот активен)`);
+    } else {
+      // Бот не запущен - просто сохраняем в файл
+      await flipUserData.saveUserAccounts(userId, userAccounts);
+      
+      // Обновляем конфигурацию пользователя
+      const userConfig = await flipUserData.loadUserConfig(userId);
+      if (userConfig) {
+        userConfig.accounts = userAccounts;
+        // Обновляем индекс текущего аккаунта в конфигурации
+        if (userConfig.currentAccountIndex >= accountIndex) {
+          userConfig.currentAccountIndex--;
+        }
+        await flipUserData.saveUserConfig(userId, userConfig);
       }
+      
+      console.log(`[MULTI-ACCOUNT] ✅ Аккаунт ${id} удален из файла (бот не активен)`);
     }
-    
-    // ВАЖНО: Если торговля не запущена, но currentAccountIndex указывает на несуществующий аккаунт, обновляем ссылку
-    if (!isRunning && multiAccountConfig.currentAccountIndex >= 0) {
-      const account = multiAccountConfig.accounts[multiAccountConfig.currentAccountIndex];
-      if (account) {
-        currentAccount = account;
-      } else {
-        currentAccount = null;
-        multiAccountConfig.currentAccountIndex = -1;
-      }
-    }
-    
-    logMultiAccount('stop', account, 'Аккаунт удален');
     
     res.json({ success: true, message: 'Аккаунт успешно удален' });
   } catch (error: any) {
@@ -4323,14 +5019,27 @@ app.delete('/api/multi-account/accounts/:id', (req, res) => {
 });
 
 // Проверить ключи аккаунта
-app.post('/api/multi-account/accounts/:id/test', async (req, res) => {
+app.post('/api/multi-account/accounts/:id/test', sharedAuth.requireAuth, async (req, res) => {
   // Устанавливаем флаг тестирования, чтобы предотвратить переключение аккаунтов
   isTestingAccount = true;
   
   try {
+    const userId = req.userId!;
     const { id } = req.params;
     
-    const account = multiAccountConfig.accounts.find(acc => acc.id === id);
+    // КРИТИЧЕСКИ ВАЖНО: Загружаем аккаунты из файла пользователя, так как после перезагрузки сервера
+    // multiAccountConfig.accounts может быть пустым
+    const userAccounts = await flipUserData.loadUserAccounts(userId);
+    console.log(`[MULTI-ACCOUNT] Загружено аккаунтов из файла для проверки: ${userAccounts?.length || 0}`);
+    
+    // Ищем аккаунт в загруженных из файла
+    let account = userAccounts.find(acc => acc.id === id);
+    
+    // Если не нашли в файле, проверяем в памяти (на случай, если бот запущен)
+    if (!account) {
+      account = multiAccountConfig.accounts.find(acc => acc.id === id);
+    }
+    
     if (!account) {
       isTestingAccount = false;
       return res.status(404).json({ success: false, error: 'Аккаунт не найден' });
@@ -4361,6 +5070,64 @@ app.post('/api/multi-account/accounts/:id/test', async (req, res) => {
   } finally {
     // Сбрасываем флаг тестирования
     isTestingAccount = false;
+  }
+});
+
+// Сбросить статус аккаунта
+app.post('/api/multi-account/accounts/:id/reset-status', sharedAuth.requireAuth, async (req, res) => {
+  try {
+    const userId = req.userId!;
+    const { id } = req.params;
+    console.log(`[MULTI-ACCOUNT] POST /api/multi-account/accounts/${id}/reset-status - запрос от пользователя ${userId}`);
+    
+    // Загружаем аккаунты пользователя из файла
+    const userAccounts = await flipUserData.loadUserAccounts(userId);
+    console.log(`[MULTI-ACCOUNT] Загружено аккаунтов из файла: ${userAccounts?.length || 0}`);
+    
+    // Ищем аккаунт в загруженных из файла
+    let account = userAccounts.find(acc => acc.id === id);
+    
+    // Если не нашли в файле, проверяем в памяти (на случай, если бот запущен)
+    if (!account) {
+      account = multiAccountConfig.accounts.find(acc => acc.id === id);
+    }
+    
+    if (!account) {
+      return res.status(404).json({ success: false, error: 'Аккаунт не найден' });
+    }
+    
+    // Сбрасываем статус аккаунта
+    account.status = 'idle';
+    account.stopReason = undefined;
+    
+    // Обновляем аккаунт в памяти, если бот запущен текущим пользователем
+    const lock = botLock.getBotLock();
+    if (lock.currentUserId === userId && isRunning) {
+      const accountInMemory = multiAccountConfig.accounts.find(acc => acc.id === id);
+      if (accountInMemory) {
+        accountInMemory.status = 'idle';
+        accountInMemory.stopReason = undefined;
+        console.log(`[MULTI-ACCOUNT] Статус аккаунта обновлен в памяти`);
+      }
+    }
+    
+    // Сохраняем аккаунты в файл
+    await flipUserData.saveUserAccounts(userId, userAccounts);
+    console.log(`[MULTI-ACCOUNT] ✅ Статус аккаунта сброшен и сохранен в файл`);
+    
+    logMultiAccount('check', account, `Статус аккаунта сброшен на 'idle'`);
+    
+    res.json({ 
+      success: true,
+      message: 'Статус аккаунта успешно сброшен',
+      data: {
+        id: account.id,
+        status: account.status
+      }
+    });
+  } catch (error: any) {
+    console.error(`[MULTI-ACCOUNT] Ошибка сброса статуса аккаунта:`, error);
+    res.status(500).json({ success: false, error: error.message });
   }
 });
 
@@ -4540,11 +5307,193 @@ app.post('/api/reports/transfer-futures-to-spot', async (req, res) => {
 
 // ==================== КОНЕЦ МУЛЬТИАККАУНТИНГА ====================
 
-// Статические файлы (CSS, JS, изображения) - ПОСЛЕ API endpoints
+// Приветственная страница на корневом пути (ПЕРЕД статическими файлами)
+app.get('/', (req, res) => {
+  // Проверяем авторизацию - если не авторизован, перенаправляем на страницу выбора
+  // Страница выбора (welcome.html) доступна всем для выбора сервиса и входа
+  // Если нужна строгая защита, можно использовать requireAuth и перенаправлять на /ferm/login или /flip/login
+  if (!req.session || !req.session.userId) {
+    // Неавторизованные пользователи видят страницу выбора (Ferm/Flipbot)
+    // где могут выбрать сервис и войти
+    return res.sendFile(path.join(__dirname, '..', 'ui', 'welcome.html'));
+  }
+  // Авторизованные пользователи тоже видят страницу выбора для перехода в сервисы
+  res.sendFile(path.join(__dirname, '..', 'ui', 'welcome.html'));
+});
+
+// ==================== ADMIN PANEL ====================
+// Общая админка для Ferm и Flipbot (ПЕРЕД статическими файлами)
+app.get('/god/', sharedAuth.requireAdmin, (req, res) => {
+  const adminPath = path.join(__dirname, 'services', 'shared', 'ui', 'admin.html');
+  console.log('[ADMIN] Serving admin panel from:', adminPath);
+  res.sendFile(adminPath);
+});
+
+// API для админки
+app.get('/api/admin/bot-status', sharedAuth.requireAdmin, async (req, res) => {
+  try {
+    const lock = botLock.getBotLock();
+    res.json({
+      success: true,
+      data: {
+        locked: lock.currentUserId !== null,
+        currentUserId: lock.currentUserId,
+        currentUsername: lock.currentUsername,
+        startTime: lock.startTime
+      }
+    });
+  } catch (error: any) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.get('/api/admin/bot-queue', sharedAuth.requireAdmin, async (req, res) => {
+  try {
+    const lock = botLock.getBotLock();
+    res.json({
+      success: true,
+      data: {
+        queue: lock.queue
+      }
+    });
+  } catch (error: any) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// Получить данные пользователей для админки (Ferm и Flipbot)
+app.get('/api/admin/users-data', sharedAuth.requireAdmin, async (req, res) => {
+  try {
+    const allUsers = await sharedUsers.getAllUsers();
+    const usersData = await Promise.all(allUsers.map(async (user) => {
+      // Ferm данные
+      const fermAccounts = await fermService.getAllAccounts(user.id);
+      
+      // Flipbot данные
+      const flipAccounts = await flipUserData.loadUserAccounts(user.id);
+      const flipConfig = await flipUserData.loadUserConfig(user.id);
+      
+      // Проверяем, занимает ли пользователь бота
+      const lock = botLock.getBotLock();
+      const isBotOwner = lock.currentUserId === user.id;
+      
+      return {
+        id: user.id,
+        username: user.username,
+        role: user.role,
+        createdAt: user.createdAt,
+        ferm: {
+          accountsCount: fermAccounts.length
+        },
+        flipbot: {
+          accountsCount: flipAccounts?.length || 0,
+          isBotOwner: isBotOwner,
+          config: flipConfig ? {
+            enabled: flipConfig.enabled,
+            targetBalance: flipConfig.targetBalance,
+            maxTradingTimeMinutes: flipConfig.maxTradingTimeMinutes
+          } : null
+        }
+      };
+    }));
+    
+    res.json({ success: true, data: usersData });
+  } catch (error: any) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.post('/api/admin/bot-force-stop', sharedAuth.requireAdmin, async (req, res) => {
+  try {
+    // Останавливаем бота
+    if (isRunning) {
+      isRunning = false;
+      if (binanceWS) {
+        binanceWS.onPriceUpdate = undefined;
+        binanceWS.onError = undefined;
+        binanceWS.onConnect = undefined;
+        binanceWS.onDisconnect = undefined;
+        binanceWS.disconnect();
+      }
+      if (mexcWS) {
+        mexcWS.onPriceUpdate = undefined;
+        mexcWS.onOrderbookUpdate = undefined;
+        mexcWS.onError = undefined;
+        mexcWS.onConnect = undefined;
+        mexcWS.onDisconnect = undefined;
+        mexcWS.disconnect();
+      }
+      if (priceMonitor) {
+        priceMonitor.onSpreadUpdate = undefined;
+      }
+      if (arbitrageStrategy) {
+        arbitrageStrategy.onSignal = undefined;
+        arbitrageStrategy.clearSignal();
+      }
+      currentPosition = null;
+    }
+    
+    // Освобождаем блокировку
+    await botLock.releaseBotLock('Принудительная остановка администратором');
+    
+    // Очищаем очередь
+    await botLock.clearQueue();
+    
+    res.json({ success: true, message: 'Бот остановлен и блокировка освобождена' });
+  } catch (error: any) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// ==================== FERM SERVICE ====================
+// Регистрация маршрутов фермы
+registerFermRoutes(app);
+
+// ==================== FLIPBOT SERVICE ====================
+// Страница авторизации (публичная)
+app.get('/flip/login', (req, res) => {
+  const loginPath = path.join(__dirname, 'services', 'flip', 'ui', 'login.html');
+  console.log('[FLIP] Serving login page from:', loginPath);
+  res.sendFile(loginPath);
+});
+
+// Основная страница Flipbot (требует авторизации)
+app.get('/flip', (req, res, next) => {
+  if (!req.session || !req.session.userId) {
+    return res.redirect('/flip/login');
+  }
+  const flipPath = path.join(__dirname, 'services', 'flip', 'ui', 'index.html');
+  console.log('[FLIP] Serving flip page from:', flipPath);
+  res.sendFile(flipPath);
+});
+
+app.get('/flip/', (req, res, next) => {
+  if (!req.session || !req.session.userId) {
+    return res.redirect('/flip/login');
+  }
+  const flipPath = path.join(__dirname, 'services', 'flip', 'ui', 'index.html');
+  console.log('[FLIP] Serving flip page from:', flipPath);
+  res.sendFile(flipPath);
+});
+
+// Статические файлы для /flip/ (ПОСЛЕ маршрутов, но ПЕРЕД общими статическими файлами)
+app.use('/flip', express.static(path.join(__dirname, 'services', 'flip', 'ui')));
+
+// API маршруты для авторизации Flipbot
+app.post('/api/flip/auth/login', sharedAuth.login);
+app.post('/api/flip/auth/logout', sharedAuth.logout);
+app.get('/api/flip/auth/check', sharedAuth.checkSession);
+
+// Статические файлы для корневого пути (CSS, JS, изображения) - ПОСЛЕ маршрутов, но ПЕРЕД catch-all
 app.use(express.static(path.join(__dirname, '..', 'ui')));
 
-// Serve frontend (catch-all route должен быть ПОСЛЕДНИМ)
+// Serve frontend для всех остальных путей (catch-all route должен быть ПОСЛЕДНИМ)
+// Исключаем /ferm и /flip, так как они обрабатываются отдельно
 app.get('*', (req, res) => {
+  // Пропускаем маршруты фермы и флипбота - они обрабатываются отдельно
+  if (req.path.startsWith('/ferm') || req.path.startsWith('/flip') || req.path.startsWith('/api')) {
+    return res.status(404).json({ error: 'Not found' });
+  }
   res.sendFile(path.join(__dirname, '..', 'ui', 'index.html'));
 });
 
@@ -4555,5 +5504,16 @@ app.listen(PORT, HOST, async () => {
   
   // Загружаем отчеты из файла при старте сервера
   await loadReportsFromFile();
+  
+  // Инициализация пользователей
+  await sharedUsers.initializeUsers();
+  
+  // Загрузка блокировки бота
+  await botLock.loadBotLock();
+  
+  // Инициализация сервиса фермы
+  await initializeFermService();
+  
+  console.log('[SERVER] ✅ Все сервисы инициализированы');
 });
 

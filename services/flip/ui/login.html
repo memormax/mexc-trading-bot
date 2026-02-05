@@ -1,0 +1,167 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Вход - Flipbot</title>
+    <link rel="stylesheet" href="/flip/styles.css">
+    <style>
+        body {
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            min-height: 100vh;
+            background: #0f172a;
+        }
+        .login-container {
+            background: #1e293b;
+            border: 1px solid #334155;
+            border-radius: 8px;
+            padding: 32px;
+            width: 100%;
+            max-width: 400px;
+        }
+        .login-container h1 {
+            color: #f1f5f9;
+            margin-bottom: 24px;
+            text-align: center;
+        }
+        .form-group {
+            margin-bottom: 16px;
+        }
+        .form-group label {
+            display: block;
+            color: #cbd5e1;
+            margin-bottom: 6px;
+            font-size: 14px;
+        }
+        .form-group input {
+            width: 100%;
+            padding: 10px 12px;
+            background: #0f172a;
+            border: 1px solid #334155;
+            border-radius: 6px;
+            color: #f1f5f9;
+            font-size: 14px;
+            box-sizing: border-box;
+        }
+        .form-group input:focus {
+            outline: none;
+            border-color: #60a5fa;
+        }
+        .error-message {
+            color: #ef4444;
+            font-size: 12px;
+            margin-top: 8px;
+            display: none;
+        }
+        .error-message.show {
+            display: block;
+        }
+        .btn-login {
+            width: 100%;
+            padding: 12px;
+            background: #3b82f6;
+            color: white;
+            border: none;
+            border-radius: 6px;
+            font-size: 16px;
+            font-weight: 600;
+            cursor: pointer;
+            margin-top: 8px;
+        }
+        .btn-login:hover {
+            background: #2563eb;
+        }
+        .btn-login:disabled {
+            background: #475569;
+            cursor: not-allowed;
+        }
+    </style>
+</head>
+<body>
+    <div class="login-container">
+        <h1>🔐 Вход в Flipbot</h1>
+        <form id="loginForm">
+            <div class="form-group">
+                <label for="username">Логин:</label>
+                <input type="text" id="username" name="username" required autocomplete="username">
+            </div>
+            <div class="form-group">
+                <label for="password">Пароль:</label>
+                <input type="password" id="password" name="password" required autocomplete="current-password">
+            </div>
+            <div class="error-message" id="errorMessage"></div>
+            <button type="submit" class="btn-login" id="loginButton">Войти</button>
+        </form>
+    </div>
+
+    <script>
+        const loginForm = document.getElementById('loginForm');
+        const errorMessage = document.getElementById('errorMessage');
+        const loginButton = document.getElementById('loginButton');
+
+        loginForm.addEventListener('submit', async (e) => {
+            e.preventDefault();
+            
+            const username = document.getElementById('username').value.trim();
+            const password = document.getElementById('password').value;
+
+            if (!username || !password) {
+                showError('Заполните все поля');
+                return;
+            }
+
+            loginButton.disabled = true;
+            loginButton.textContent = 'Вход...';
+            errorMessage.classList.remove('show');
+
+            try {
+                const response = await fetch('/api/flip/auth/login', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    credentials: 'include',
+                    body: JSON.stringify({ username, password })
+                });
+
+                const result = await response.json();
+
+                if (result.success) {
+                    // Перенаправляем на главную страницу
+                    window.location.href = '/flip/';
+                } else {
+                    showError(result.error || 'Ошибка входа');
+                    loginButton.disabled = false;
+                    loginButton.textContent = 'Войти';
+                }
+            } catch (error) {
+                showError('Ошибка соединения с сервером');
+                loginButton.disabled = false;
+                loginButton.textContent = 'Войти';
+            }
+        });
+
+        function showError(message) {
+            errorMessage.textContent = message;
+            errorMessage.classList.add('show');
+        }
+
+        // Проверяем, не авторизован ли уже пользователь
+        (async () => {
+            try {
+                const response = await fetch('/api/flip/auth/check', {
+                    credentials: 'include'
+                });
+                const result = await response.json();
+                if (result.success && result.authenticated) {
+                    window.location.href = '/flip/';
+                }
+            } catch (error) {
+                // Игнорируем ошибку
+            }
+        })();
+    </script>
+</body>
+</html>

@@ -4,7 +4,19 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>MEXC Futures Trading Bot</title>
-    <link rel="stylesheet" href="styles.css">
+    <link rel="stylesheet" href="/styles.css" id="main-stylesheet">
+    <script>
+        // Обновляем пути к статическим файлам в зависимости от текущего пути
+        (function() {
+            const path = window.location.pathname;
+            if (path.startsWith('/flip')) {
+                const stylesheet = document.getElementById('main-stylesheet');
+                if (stylesheet) {
+                    stylesheet.href = '/flip/styles.css';
+                }
+            }
+        })();
+    </script>
 </head>
 <body>
     <div class="container">
@@ -435,7 +447,19 @@
         </div>
     </div>
 
-    <script src="app.js"></script>
-    <script src="arbitrage-functions.js"></script>
+    <script src="/app.js" id="app-script"></script>
+    <script src="/arbitrage-functions.js" id="arbitrage-script"></script>
+    <script>
+        // Обновляем пути к JS файлам в зависимости от текущего пути
+        (function() {
+            const path = window.location.pathname;
+            if (path.startsWith('/flip')) {
+                const appScript = document.getElementById('app-script');
+                const arbitrageScript = document.getElementById('arbitrage-script');
+                if (appScript) appScript.src = '/flip/app.js';
+                if (arbitrageScript) arbitrageScript.src = '/flip/arbitrage-functions.js';
+            }
+        })();
+    </script>
 </body>
 </html>

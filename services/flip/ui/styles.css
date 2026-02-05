@@ -1,0 +1,490 @@
+* {
+    margin: 0;
+    padding: 0;
+    box-sizing: border-box;
+}
+
+body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+    background: #0f172a;
+    color: white;
+    overflow-x: hidden;
+    font-size: 14px;
+}
+
+.container {
+    max-width: 1800px;
+    margin: 0 auto;
+    padding: 10px;
+}
+
+header {
+    background: #1e293b;
+    padding: 10px 15px;
+    border-radius: 8px;
+    margin-bottom: 10px;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3);
+    border: 1px solid #334155;
+}
+
+header h1 {
+    font-size: 18px;
+    color: #60a5fa;
+}
+
+.connection-status {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-weight: 500;
+    font-size: 12px;
+    color: white;
+}
+
+.status-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: #ef4444;
+    animation: pulse 2s infinite;
+}
+
+.status-dot.connected {
+    background: #10b981;
+}
+
+@keyframes pulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.5; }
+}
+
+.main-content {
+    display: grid;
+    grid-template-columns: 1fr 1fr 1fr;
+    gap: 10px;
+}
+
+.left-panel, .middle-panel, .right-panel {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+}
+
+.card {
+    background: #1e293b;
+    border-radius: 8px;
+    padding: 10px;
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3);
+    transition: transform 0.2s, box-shadow 0.2s;
+    border: 1px solid #334155;
+}
+
+.card:hover {
+    transform: translateY(-1px);
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.4);
+    border-color: #475569;
+}
+
+.card h2 {
+    font-size: 16px;
+    margin-bottom: 8px;
+    color: #60a5fa;
+    border-bottom: 1px solid #334155;
+    padding-bottom: 6px;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+}
+
+.card h2 .refresh-btn {
+    font-size: 10px;
+    padding: 2px 6px;
+    margin: 0;
+    height: auto;
+    line-height: 1.2;
+}
+
+.form-group {
+    margin-bottom: 6px;
+}
+
+.collapsible-content {
+    display: block;
+    transition: max-height 0.3s ease-out, opacity 0.3s ease-out;
+    overflow: hidden;
+}
+
+.collapsible-content[style*="display: none"] {
+    max-height: 0;
+    opacity: 0;
+}
+
+.form-group label {
+    display: block;
+    margin-bottom: 4px;
+    font-weight: 500;
+    color: white;
+    font-size: 13px;
+    line-height: 1.4;
+    min-height: 18px;
+}
+
+.form-group input,
+.form-group select {
+    width: 100%;
+    padding: 4px 8px;
+    border: 1px solid #334155;
+    border-radius: 4px;
+    font-size: 14px;
+    transition: border-color 0.2s;
+    line-height: 1.4;
+    min-height: 28px;
+    box-sizing: border-box;
+    background: #0f172a;
+    color: white;
+}
+
+.form-group input:focus,
+.form-group select:focus {
+    outline: none;
+    border-color: #60a5fa;
+    background: #1e293b;
+}
+
+.form-group input[type="password"] {
+    font-family: monospace;
+    font-size: 11px;
+}
+
+.hint {
+    display: block;
+    font-size: 10px;
+    color: white;
+    margin-top: 2px;
+}
+
+.btn-primary,
+.btn-secondary,
+.btn-success,
+.btn-danger,
+.btn-warning,
+.btn-info,
+.btn-small {
+    padding: 8px 14px;
+    border: none;
+    border-radius: 4px;
+    font-size: 13px;
+    font-weight: 500;
+    cursor: pointer;
+    transition: all 0.2s;
+    margin-right: 6px;
+    margin-bottom: 6px;
+}
+
+.btn-primary {
+    background: #3b82f6;
+    color: white;
+}
+
+.btn-primary:hover {
+    background: #2563eb;
+    transform: translateY(-1px);
+}
+
+.btn-secondary {
+    background: #475569;
+    color: white;
+}
+
+.btn-secondary:hover {
+    background: #334155;
+}
+
+.btn-success {
+    background: #10b981;
+    color: white;
+}
+
+.btn-success:hover {
+    background: #059669;
+}
+
+.btn-danger {
+    background: #ef4444;
+    color: white;
+}
+
+.btn-danger:hover {
+    background: #dc2626;
+}
+
+.btn-warning {
+    background: #f59e0b;
+    color: white;
+}
+
+.btn-warning:hover {
+    background: #d97706;
+}
+
+.btn-info {
+    background: #3b82f6;
+    color: white;
+}
+
+.btn-info:hover {
+    background: #2563eb;
+}
+
+.btn-small {
+    padding: 4px 8px;
+    font-size: 10px;
+    margin-top: 4px;
+}
+
+.action-buttons {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+}
+
+.quick-actions {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 6px;
+    margin-bottom: 8px;
+}
+
+.quick-btn {
+    font-size: 12px;
+    padding: 10px 8px;
+    font-weight: 600;
+}
+
+.market-data {
+    background: #0f172a;
+    padding: 8px;
+    border-radius: 4px;
+    margin-top: 8px;
+    font-size: 11px;
+    border: 1px solid #334155;
+}
+
+.market-data-compact {
+    background: #0f172a;
+    padding: 6px;
+    border-radius: 4px;
+    font-size: 10px;
+    border: 1px solid #334155;
+}
+
+.market-data-item {
+    display: flex;
+    justify-content: space-between;
+    padding: 3px 0;
+    border-bottom: 1px solid #334155;
+    font-size: 11px;
+    color: white;
+}
+
+.market-data-compact .market-data-item {
+    padding: 2px 0;
+    font-size: 10px;
+    line-height: 1.3;
+}
+
+.market-data-item:last-child {
+    border-bottom: none;
+}
+
+.market-data-item strong {
+    color: #60a5fa;
+    font-size: 11px;
+}
+
+.info-display {
+    background: #0f172a;
+    padding: 10px;
+    border-radius: 4px;
+    max-height: 200px;
+    overflow-y: auto;
+    font-size: 13px;
+    border: 1px solid #334155;
+    color: white;
+}
+
+.info-display table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 10px;
+}
+
+.info-display th,
+.info-display td {
+    padding: 6px;
+    text-align: left;
+    border-bottom: 1px solid #334155;
+    font-size: 12px;
+    color: white;
+}
+
+.info-display th {
+    background: #1e293b;
+    color: #60a5fa;
+    font-weight: 600;
+    font-size: 10px;
+    padding: 6px 4px;
+    border-bottom: 1px solid #334155;
+}
+
+.info-display tr:hover {
+    background: #1e293b;
+}
+
+.log-display {
+    background: #1f2937;
+    color: white;
+    padding: 8px;
+    border-radius: 4px;
+    max-height: 150px;
+    overflow-y: auto;
+    font-family: 'Courier New', monospace;
+    font-size: 13px;
+    line-height: 1.5;
+}
+
+.log-entry {
+    margin-bottom: 3px;
+    padding: 2px;
+    border-left: 2px solid #10b981;
+    padding-left: 6px;
+    color: white;
+}
+
+.log-entry.error {
+    color: white;
+    border-left-color: #ef4444;
+}
+
+.log-entry.warning {
+    color: white;
+    border-left-color: #f59e0b;
+}
+
+.log-entry.info {
+    color: white;
+    border-left-color: #3b82f6;
+}
+
+.price-positive {
+    color: #10b981;
+    font-weight: 600;
+}
+
+.price-negative {
+    color: #ef4444;
+    font-weight: 600;
+}
+
+.position-long {
+    color: #10b981;
+    font-weight: 600;
+}
+
+.position-short {
+    color: #ef4444;
+    font-weight: 600;
+}
+
+/* Scrollbar styling */
+.info-display::-webkit-scrollbar,
+.log-display::-webkit-scrollbar {
+    width: 6px;
+}
+
+.info-display::-webkit-scrollbar-track,
+.log-display::-webkit-scrollbar-track {
+    background: #1e293b;
+    border-radius: 3px;
+}
+
+.info-display::-webkit-scrollbar-thumb,
+.log-display::-webkit-scrollbar-thumb {
+    background: #475569;
+    border-radius: 3px;
+}
+
+.info-display::-webkit-scrollbar-thumb:hover,
+.log-display::-webkit-scrollbar-thumb:hover {
+    background: #64748b;
+}
+
+/* Responsive */
+@media (max-width: 1600px) {
+    .main-content {
+        grid-template-columns: 1fr 1fr;
+    }
+    .right-panel {
+        grid-column: 1 / -1;
+    }
+}
+
+@media (max-width: 1200px) {
+    .main-content {
+        grid-template-columns: 1fr;
+    }
+}
+
+/* Компактные формы */
+.form-group input[type="number"],
+.form-group input[type="text"] {
+    height: 28px;
+}
+
+.form-group select {
+    height: 28px;
+}
+
+/* Компактные кнопки в формах */
+.form-group button {
+    margin-top: 4px;
+    margin-bottom: 0;
+}
+
+/* Компактный чекбокс */
+.form-group input[type="checkbox"] {
+    width: auto;
+    margin-right: 6px;
+}
+
+/* Loading spinner */
+.loading {
+    display: inline-block;
+    width: 12px;
+    height: 12px;
+    border: 2px solid #334155;
+    border-top: 2px solid #60a5fa;
+    border-radius: 50%;
+    animation: spin 1s linear infinite;
+    margin-left: 6px;
+}
+
+/* Темная тема для input[type="radio"] и checkbox */
+input[type="radio"],
+input[type="checkbox"] {
+    accent-color: #60a5fa;
+}
+
+/* Темная тема для placeholder */
+input::placeholder,
+textarea::placeholder {
+    color: #64748b;
+}
+
+@keyframes spin {
+    0% { transform: rotate(0deg); }
+    100% { transform: rotate(360deg); }
+}

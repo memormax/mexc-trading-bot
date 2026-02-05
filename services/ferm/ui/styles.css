@@ -1,0 +1,679 @@
+* {
+    margin: 0;
+    padding: 0;
+    box-sizing: border-box;
+}
+
+body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+    background: #0f172a;
+    color: white;
+    overflow-x: hidden;
+    font-size: 14px;
+}
+
+.container {
+    max-width: 1800px;
+    margin: 0 auto;
+    padding: 10px;
+}
+
+header {
+    background: #1e293b;
+    padding: 10px 15px;
+    border-radius: 8px;
+    margin-bottom: 10px;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3);
+    border: 1px solid #334155;
+}
+
+header h1 {
+    font-size: 18px;
+    color: #60a5fa;
+}
+
+.connection-status {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-weight: 500;
+    font-size: 12px;
+    color: white;
+}
+
+.status-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: #10b981;
+    animation: pulse 2s infinite;
+}
+
+@keyframes pulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.5; }
+}
+
+/* Два столбца */
+.main-content {
+    display: grid;
+    grid-template-columns: 750px 0.75fr;
+    gap: 10px;
+    max-width: 1800px;
+    margin: 0 auto;
+}
+
+.accounts-column {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+}
+
+.trading-column {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+}
+
+.card {
+    background: #1e293b;
+    border-radius: 8px;
+    padding: 12px;
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3);
+    transition: transform 0.2s, box-shadow 0.2s;
+    border: 1px solid #334155;
+}
+
+.card:hover {
+    transform: translateY(-1px);
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.4);
+    border-color: #475569;
+}
+
+.card h2 {
+    font-size: 16px;
+    margin-bottom: 12px;
+    color: #60a5fa;
+    border-bottom: 1px solid #334155;
+    padding-bottom: 6px;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+}
+
+/* Список аккаунтов */
+.accounts-list {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 8px;
+    max-height: calc(100vh - 300px);
+    overflow-y: auto;
+    align-items: start;
+}
+
+.account-card {
+    background: #0f172a;
+    border: 1px solid #334155;
+    border-radius: 6px;
+    padding: 8px;
+    transition: all 0.2s;
+    cursor: pointer;
+    min-width: 0;
+    overflow: hidden;
+    display: flex;
+    flex-direction: column;
+    height: 100%;
+    box-sizing: border-box;
+}
+
+.account-card:hover {
+    border-color: #60a5fa;
+    background: #1e293b;
+}
+
+.account-card.selected {
+    border-color: #10b981;
+    background: #1e293b;
+}
+
+.account-card.error {
+    border-color: #ef4444;
+}
+
+/* Позиции меняют фон, а не обводку */
+.account-card.has-long-position {
+    background: rgba(16, 185, 129, 0.2) !important;
+    border-color: #334155;
+}
+
+.account-card.has-long-position:hover {
+    background: rgba(16, 185, 129, 0.25) !important;
+}
+
+.account-card.has-short-position {
+    background: rgba(239, 68, 68, 0.2) !important;
+    border-color: #334155;
+}
+
+.account-card.has-short-position:hover {
+    background: rgba(239, 68, 68, 0.25) !important;
+}
+
+/* Комбинация: выделенный аккаунт с позицией */
+.account-card.selected.has-long-position {
+    border-color: #10b981;
+    background: rgba(16, 185, 129, 0.25) !important;
+}
+
+.account-card.selected.has-short-position {
+    border-color: #10b981;
+    background: rgba(239, 68, 68, 0.25) !important;
+}
+
+.account-header {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 8px;
+    flex-shrink: 0;
+}
+
+.account-checkbox {
+    width: 18px;
+    height: 18px;
+    cursor: pointer;
+}
+
+.account-name {
+    font-weight: 600;
+    color: white;
+    flex: 1;
+    font-size: 13px;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.account-status {
+    font-size: 10px;
+    padding: 2px 6px;
+    border-radius: 4px;
+    font-weight: 500;
+}
+
+.account-status.active {
+    background: #10b981;
+    color: white;
+}
+
+.account-status.inactive {
+    background: #64748b;
+    color: white;
+}
+
+.account-status.error {
+    background: #ef4444;
+    color: white;
+}
+
+.account-info {
+    font-size: 11px;
+    color: #94a3b8;
+    margin-bottom: 6px;
+    flex: 1;
+    min-height: 0;
+}
+
+.account-balance {
+    font-size: 12px;
+    color: #60a5fa;
+    font-weight: 500;
+    margin-bottom: 6px;
+}
+
+.account-actions {
+    display: flex;
+    gap: 4px;
+    margin-top: auto;
+    flex-shrink: 0;
+}
+
+.account-actions button {
+    flex: 1;
+    padding: 4px 8px;
+    font-size: 10px;
+}
+
+.empty-state {
+    text-align: center;
+    color: #64748b;
+    font-size: 12px;
+    padding: 20px;
+}
+
+/* Формы */
+.form-group {
+    margin-bottom: 10px;
+}
+
+.form-group label {
+    display: block;
+    margin-bottom: 4px;
+    font-weight: 500;
+    color: white;
+    font-size: 13px;
+}
+
+.form-group input,
+.form-group select {
+    width: 100%;
+    padding: 6px 8px;
+    border: 1px solid #334155;
+    border-radius: 4px;
+    font-size: 14px;
+    background: #0f172a;
+    color: white;
+    transition: border-color 0.2s;
+}
+
+.form-group input:focus,
+.form-group select:focus {
+    outline: none;
+    border-color: #60a5fa;
+    background: #1e293b;
+}
+
+/* Выделенные поля ввода */
+.highlighted-input {
+    font-size: 16px !important;
+    padding: 10px 12px !important;
+    font-weight: 500 !important;
+    border: 1px solid #475569 !important;
+    background: #0f172a !important;
+    transition: all 0.2s !important;
+}
+
+.highlighted-input:focus {
+    border-color: #64748b !important;
+    background: #1e293b !important;
+    box-shadow: 0 0 0 2px rgba(100, 116, 139, 0.15) !important;
+}
+
+.volume-input {
+    max-width: 200px !important;
+    width: 200px !important;
+}
+
+.form-group input[type="password"] {
+    font-family: monospace;
+    font-size: 11px;
+}
+
+/* Кнопки */
+.btn-primary,
+.btn-secondary,
+.btn-success,
+.btn-danger,
+.btn-warning,
+.btn-info,
+.btn-small {
+    padding: 8px 14px;
+    border: none;
+    border-radius: 4px;
+    font-size: 13px;
+    font-weight: 500;
+    cursor: pointer;
+    transition: all 0.2s;
+}
+
+.btn-primary {
+    background: #475569;
+    color: white;
+}
+
+.btn-primary:hover {
+    background: #334155;
+    transform: translateY(-1px);
+}
+
+.btn-secondary {
+    background: #475569;
+    color: white;
+}
+
+.btn-secondary:hover {
+    background: #334155;
+}
+
+.btn-success {
+    background: #059669;
+    color: white;
+}
+
+.btn-success:hover {
+    background: #047857;
+}
+
+.btn-danger {
+    background: #dc2626;
+    color: white;
+}
+
+.btn-danger:hover {
+    background: #b91c1c;
+}
+
+.btn-warning {
+    background: #d97706;
+    color: white;
+}
+
+.btn-warning:hover {
+    background: #b45309;
+}
+
+.btn-info {
+    background: #0891b2;
+    color: white;
+}
+
+.btn-info:hover {
+    background: #0e7490;
+}
+
+.btn-small {
+    padding: 4px 8px;
+    font-size: 11px;
+}
+
+.action-buttons {
+    display: flex;
+    flex-wrap: nowrap;
+    gap: 8px;
+}
+
+.quick-actions {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 6px;
+    margin-bottom: 8px;
+}
+
+.quick-btn {
+    font-size: 12px;
+    padding: 10px 8px;
+    font-weight: 600;
+}
+
+.action-buttons button {
+    flex: 1;
+    min-width: 120px;
+    max-width: 200px;
+}
+
+.trading-column .card {
+    max-width: 100%;
+}
+
+.trading-column .form-group input,
+.trading-column .form-group select {
+    max-width: 100%;
+}
+
+/* Результаты операций */
+.operation-results {
+    background: #0f172a;
+    padding: 10px;
+    border-radius: 4px;
+    max-height: 300px;
+    overflow-y: auto;
+    font-size: 12px;
+    border: 1px solid #334155;
+}
+
+.operation-result-item {
+    padding: 8px;
+    margin-bottom: 6px;
+    border-radius: 4px;
+    border-left: 3px solid #334155;
+    background: #1e293b;
+}
+
+.operation-result-item.success {
+    border-left-color: #10b981;
+}
+
+.operation-result-item.error {
+    border-left-color: #ef4444;
+}
+
+.operation-result-item.pending {
+    border-left-color: #f59e0b;
+}
+
+.operation-result-account {
+    font-weight: 600;
+    color: #60a5fa;
+    margin-bottom: 4px;
+}
+
+.operation-result-message {
+    color: white;
+    font-size: 11px;
+}
+
+/* Модальное окно */
+.modal {
+    position: fixed;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 100%;
+    background: rgba(0, 0, 0, 0.7);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    z-index: 1000;
+}
+
+.modal-content {
+    background: #1e293b;
+    border-radius: 8px;
+    padding: 20px;
+    max-width: 500px;
+    width: 90%;
+    max-height: 90vh;
+    overflow-y: auto;
+    border: 1px solid #334155;
+}
+
+.modal-content h2 {
+    color: #60a5fa;
+    margin-bottom: 20px;
+}
+
+/* Scrollbar */
+.accounts-list::-webkit-scrollbar,
+.operation-results::-webkit-scrollbar {
+    width: 6px;
+}
+
+.accounts-list::-webkit-scrollbar-track,
+.operation-results::-webkit-scrollbar-track {
+    background: #1e293b;
+    border-radius: 3px;
+}
+
+.accounts-list::-webkit-scrollbar-thumb,
+.operation-results::-webkit-scrollbar-thumb {
+    background: #475569;
+    border-radius: 3px;
+}
+
+.accounts-list::-webkit-scrollbar-thumb:hover,
+.operation-results::-webkit-scrollbar-thumb:hover {
+    background: #64748b;
+}
+
+/* Hint */
+.hint {
+    display: block;
+    font-size: 11px;
+    color: #94a3b8;
+    margin-top: 4px;
+}
+
+/* Ползунок выбора аккаунтов */
+.account-selector-slider {
+    padding: 10px;
+    background: #0f172a;
+    border: 1px solid #334155;
+    border-radius: 6px;
+}
+
+/* Карточка общего баланса */
+.total-balance-card {
+    transition: all 0.2s;
+}
+
+.total-balance-card:hover {
+    border-color: #475569;
+    background: #1e293b !important;
+}
+
+.account-selector-slider input[type="range"] {
+    -webkit-appearance: none;
+    appearance: none;
+    width: 100%;
+    height: 6px;
+    border-radius: 3px;
+    background: #334155;
+    outline: none;
+    transition: background 0.2s;
+}
+
+.account-selector-slider input[type="range"]:hover {
+    background: #475569;
+}
+
+.account-selector-slider input[type="range"]::-webkit-slider-thumb {
+    -webkit-appearance: none;
+    appearance: none;
+    width: 18px;
+    height: 18px;
+    border-radius: 50%;
+    background: #60a5fa;
+    cursor: pointer;
+    transition: background 0.2s, transform 0.2s;
+    box-shadow: 0 2px 4px rgba(0, 0, 0, 0.3);
+}
+
+.account-selector-slider input[type="range"]::-webkit-slider-thumb:hover {
+    background: #3b82f6;
+    transform: scale(1.1);
+}
+
+.account-selector-slider input[type="range"]::-moz-range-thumb {
+    width: 18px;
+    height: 18px;
+    border-radius: 50%;
+    background: #60a5fa;
+    cursor: pointer;
+    border: none;
+    transition: background 0.2s, transform 0.2s;
+    box-shadow: 0 2px 4px rgba(0, 0, 0, 0.3);
+}
+
+.account-selector-slider input[type="range"]::-moz-range-thumb:hover {
+    background: #3b82f6;
+    transform: scale(1.1);
+}
+
+/* Стили для ползунка частичного закрытия */
+#partialCloseSlider {
+    -webkit-appearance: none;
+    appearance: none;
+    background: #334155;
+    height: 6px;
+    border-radius: 3px;
+    outline: none;
+    cursor: pointer;
+}
+
+#partialCloseSlider::-webkit-slider-thumb {
+    -webkit-appearance: none;
+    appearance: none;
+    width: 18px;
+    height: 18px;
+    border-radius: 50%;
+    background: #60a5fa;
+    cursor: pointer;
+    border: 2px solid #1e293b;
+    box-shadow: 0 2px 4px rgba(0, 0, 0, 0.3);
+    transition: all 0.2s ease;
+}
+
+#partialCloseSlider::-webkit-slider-thumb:hover {
+    background: #3b82f6;
+    transform: scale(1.1);
+}
+
+#partialCloseSlider::-moz-range-thumb {
+    width: 18px;
+    height: 18px;
+    border-radius: 50%;
+    background: #60a5fa;
+    cursor: pointer;
+    border: 2px solid #1e293b;
+    box-shadow: 0 2px 4px rgba(0, 0, 0, 0.3);
+    transition: all 0.2s ease;
+}
+
+#partialCloseSlider::-moz-range-thumb:hover {
+    background: #3b82f6;
+    transform: scale(1.1);
+}
+
+/* Стили для кнопок групп аккаунтов */
+.account-group-btn {
+    padding: 8px 12px;
+    background: #1e293b;
+    border: 1px solid #334155;
+    border-radius: 6px;
+    color: white;
+    font-size: 11px;
+    cursor: pointer;
+    transition: all 0.2s ease;
+    text-align: center;
+}
+
+.account-group-btn:hover {
+    background: #334155;
+    border-color: #475569;
+    transform: translateY(-1px);
+}
+
+.account-group-btn:active {
+    transform: translateY(0);
+    background: #475569;
+}
+
+/* Responsive */
+@media (max-width: 1200px) {
+    .main-content {
+        grid-template-columns: 1fr;
+    }
+    
+    .accounts-column {
+        order: 2;
+    }
+    
+    .trading-column {
+        order: 1;
+    }
+}
+

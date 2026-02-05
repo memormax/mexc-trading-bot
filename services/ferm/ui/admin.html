@@ -1,0 +1,445 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Админ панель - Ferm Service</title>
+    <link rel="stylesheet" href="/ferm/styles.css">
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>Админ панель - Ferm Service</h1>
+            <div style="display: flex; align-items: center; gap: 16px;">
+                <span id="currentUsername" style="color: #94a3b8; font-size: 12px;"></span>
+                <button class="btn-danger" onclick="logout()" style="padding: 6px 12px; font-size: 12px;">Выйти</button>
+            </div>
+        </header>
+
+        <div class="main-content" style="grid-template-columns: 1fr;">
+            <!-- Создание пользователя -->
+            <section class="card">
+                <h2>Создать пользователя</h2>
+                <div class="form-group" style="display: grid; grid-template-columns: 1fr 1fr 1fr auto; gap: 12px; align-items: end;">
+                    <div>
+                        <label for="newUsername">Логин:</label>
+                        <input type="text" id="newUsername" class="form-input" required>
+                    </div>
+                    <div>
+                        <label for="newPassword">Пароль:</label>
+                        <input type="password" id="newPassword" class="form-input" required>
+                    </div>
+                    <div>
+                        <label for="newRole">Роль:</label>
+                        <select id="newRole" class="form-input">
+                            <option value="user">Пользователь</option>
+                            <option value="admin">Администратор</option>
+                        </select>
+                    </div>
+                    <button class="btn-success btn-small" onclick="createUser()">Создать</button>
+                </div>
+            </section>
+
+            <!-- Список пользователей -->
+            <section class="card">
+                <h2>Пользователи</h2>
+                <div id="usersList">
+                    <div style="color: #94a3b8; text-align: center; padding: 20px;">Загрузка...</div>
+                </div>
+            </section>
+        </div>
+    </div>
+
+    <script>
+        let currentUser = null;
+
+        // Загружаем информацию о текущем пользователе
+        async function loadCurrentUser() {
+            try {
+                const response = await fetch('/api/ferm/auth/check', {
+                    credentials: 'include'
+                });
+                const result = await response.json();
+                
+                if (result.success && result.authenticated) {
+                    currentUser = result.data;
+                    document.getElementById('currentUsername').textContent = `Пользователь: ${result.data.username}`;
+                }
+            } catch (error) {
+                console.error('Ошибка загрузки информации о пользователе:', error);
+            }
+        }
+
+        async function loadUsers() {
+            try {
+                const response = await fetch('/api/ferm/admin/users', {
+                    credentials: 'include'
+                });
+                const result = await response.json();
+                
+                if (result.success) {
+                    renderUsers(result.data);
+                } else {
+                    document.getElementById('usersList').innerHTML = 
+                        `<div style="color: #ef4444; padding: 20px;">Ошибка загрузки: ${result.error}</div>`;
+                }
+            } catch (error) {
+                document.getElementById('usersList').innerHTML = 
+                    `<div style="color: #ef4444; padding: 20px;">Ошибка соединения</div>`;
+            }
+        }
+
+        async function renderUsers(users) {
+            if (users.length === 0) {
+                document.getElementById('usersList').innerHTML = 
+                    `<div style="color: #94a3b8; text-align: center; padding: 20px;">Нет пользователей</div>`;
+                return;
+            }
+
+            const usersHtml = await Promise.all(users.map(async (user) => {
+                const accountsCount = await getUserAccountsCount(user.id);
+                const balances = user.balances || null; // Балансы будут загружены при нажатии на кнопку
+                
+                let balancesHtml = '';
+                if (balances !== null) {
+                    if (balances.length === 0) {
+                        balancesHtml = '<div style="color: #94a3b8; font-size: 11px; margin-top: 4px;">Нет аккаунтов</div>';
+                    } else {
+                        const totalBalance = balances.reduce((sum, b) => sum + (parseFloat(b.balance) || 0), 0);
+                        balancesHtml = `
+                            <div style="margin-top: 8px; padding-top: 8px; border-top: 1px solid #334155;">
+                                <div style="color: #60a5fa; font-size: 11px; margin-bottom: 4px; font-weight: 600;">
+                                    Общий баланс: ${formatNumber(totalBalance)} USDT
+                                </div>
+                                <div style="font-size: 10px; color: #94a3b8;">
+                                    ${balances.map(b => `${b.name}: ${formatNumber(b.balance)} USDT`).join(' | ')}
+                                </div>
+                            </div>
+                        `;
+                    }
+                }
+                
+                return `
+                    <div data-user-id="${user.id}" style="padding: 12px; border-bottom: 1px solid #334155; margin-bottom: 8px;">
+                        <div style="display: flex; justify-content: space-between; align-items: start;">
+                            <div style="flex: 1;">
+                                <div style="color: #f1f5f9; font-weight: 600; margin-bottom: 4px;">
+                                    ${user.username} ${user.role === 'admin' ? '(Админ)' : ''}
+                                </div>
+                                <div style="color: #94a3b8; font-size: 12px; margin-bottom: 4px;">
+                                    Аккаунтов: ${accountsCount} | 
+                                    Создан: ${new Date(user.createdAt).toLocaleString('ru-RU')}
+                                </div>
+                                ${balancesHtml}
+                            </div>
+                            <div style="display: flex; gap: 8px; align-items: start; flex-wrap: wrap;">
+                                <button class="btn-info btn-small" onclick="checkUserBalances('${user.id}')" style="padding: 4px 12px; font-size: 11px;">
+                                    Балансы
+                                </button>
+                                <button class="btn-success btn-small" onclick="exportUserAccounts('${user.id}', '${user.username}')" style="padding: 4px 12px; font-size: 11px;">
+                                    Экспорт
+                                </button>
+                                <button class="btn-warning btn-small" onclick="importUserAccounts('${user.id}', '${user.username}')" style="padding: 4px 12px; font-size: 11px;">
+                                    Импорт
+                                </button>
+                                ${user.role !== 'admin' ? `
+                                    <button class="btn-danger btn-small" onclick="deleteUser('${user.id}', '${user.username}')" style="padding: 4px 12px; font-size: 11px;">
+                                        Удалить
+                                    </button>
+                                ` : ''}
+                            </div>
+                        </div>
+                    </div>
+                `;
+            }));
+
+            document.getElementById('usersList').innerHTML = usersHtml.join('');
+        }
+
+        function formatNumber(num) {
+            if (num === null || num === undefined || isNaN(num)) return '0.00';
+            return parseFloat(num).toFixed(2);
+        }
+
+        async function getUserAccountsCount(userId) {
+            try {
+                const response = await fetch(`/api/ferm/admin/users/${userId}/accounts-count`, {
+                    credentials: 'include'
+                });
+                const result = await response.json();
+                return result.success ? result.data.count : 0;
+            } catch {
+                return 0;
+            }
+        }
+
+        async function checkUserBalances(userId) {
+            try {
+                // Находим элемент пользователя и показываем загрузку
+                const usersList = document.getElementById('usersList');
+                const userElement = usersList.querySelector(`[data-user-id="${userId}"]`);
+                
+                const response = await fetch(`/api/ferm/admin/users/${userId}/check-balances`, {
+                    method: 'POST',
+                    credentials: 'include'
+                });
+
+                const result = await response.json();
+
+                if (result.success) {
+                    // Обновляем балансы в объекте пользователя и перерисовываем
+                    const usersResponse = await fetch('/api/ferm/admin/users', {
+                        credentials: 'include'
+                    });
+                    const usersResult = await usersResponse.json();
+                    
+                    if (usersResult.success) {
+                        // Добавляем балансы к пользователю
+                        const user = usersResult.data.find(u => u.id === userId);
+                        if (user && result.data.balances) {
+                            user.balances = result.data.balances;
+                        }
+                        renderUsers(usersResult.data);
+                    }
+                } else {
+                    alert(`Ошибка: ${result.error}`);
+                }
+            } catch (error) {
+                alert('Ошибка соединения');
+            }
+        }
+
+        async function createUser() {
+            const username = document.getElementById('newUsername').value.trim();
+            const password = document.getElementById('newPassword').value;
+            const role = document.getElementById('newRole').value;
+
+            if (!username || !password) {
+                alert('Заполните все поля');
+                return;
+            }
+
+            try {
+                const response = await fetch('/api/ferm/admin/users', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    credentials: 'include',
+                    body: JSON.stringify({ username, password, role })
+                });
+
+                const result = await response.json();
+
+                if (result.success) {
+                    document.getElementById('newUsername').value = '';
+                    document.getElementById('newPassword').value = '';
+                    document.getElementById('newRole').value = 'user';
+                    await loadUsers();
+                } else {
+                    alert(`Ошибка: ${result.error}`);
+                }
+            } catch (error) {
+                alert('Ошибка соединения');
+            }
+        }
+
+        async function deleteUser(userId, username) {
+            if (!confirm(`Удалить пользователя "${username}"? Все его данные будут удалены!`)) {
+                return;
+            }
+
+            try {
+                const response = await fetch(`/api/ferm/admin/users/${userId}`, {
+                    method: 'DELETE',
+                    credentials: 'include'
+                });
+
+                const result = await response.json();
+
+                if (result.success) {
+                    await loadUsers();
+                } else {
+                    alert(`Ошибка: ${result.error}`);
+                }
+            } catch (error) {
+                alert('Ошибка соединения');
+            }
+        }
+
+        async function logout() {
+            try {
+                await fetch('/api/ferm/auth/logout', {
+                    method: 'POST',
+                    credentials: 'include'
+                });
+                window.location.href = '/ferm/login';
+            } catch (error) {
+                window.location.href = '/ferm/login';
+            }
+        }
+
+        // Экспорт аккаунтов пользователя
+        async function exportUserAccounts(userId, username) {
+            try {
+                const response = await fetch(`/api/ferm/admin/users/${userId}/accounts`, {
+                    credentials: 'include'
+                });
+                const result = await response.json();
+                
+                if (!result.success || !result.data || result.data.length === 0) {
+                    alert(`У пользователя "${username}" нет аккаунтов для экспорта`);
+                    return;
+                }
+                
+                const accounts = result.data;
+                
+                // Формируем текст файла
+                let fileContent = '';
+                accounts.forEach((account, index) => {
+                    if (index > 0) {
+                        fileContent += '\n\n';
+                    }
+                    fileContent += `${account.name}\n`;
+                    fileContent += `${account.apiKey || ''}\n`;
+                    fileContent += `${account.apiSecret || ''}\n`;
+                    fileContent += `${account.webToken || ''}`;
+                });
+                
+                // Создаем blob и скачиваем файл
+                const blob = new Blob([fileContent], { type: 'text/plain;charset=utf-8' });
+                const url = URL.createObjectURL(blob);
+                const link = document.createElement('a');
+                link.href = url;
+                link.download = `ferm-accounts-${username}-${new Date().toISOString().split('T')[0]}.txt`;
+                document.body.appendChild(link);
+                link.click();
+                document.body.removeChild(link);
+                URL.revokeObjectURL(url);
+                
+                alert(`Экспортировано ${accounts.length} аккаунтов пользователя "${username}"`);
+            } catch (error) {
+                alert(`Ошибка экспорта: ${error.message}`);
+            }
+        }
+
+        // Импорт аккаунтов для пользователя
+        function importUserAccounts(userId, username) {
+            const fileInput = document.createElement('input');
+            fileInput.type = 'file';
+            fileInput.accept = '.txt';
+            fileInput.onchange = async (event) => {
+                const file = event.target.files[0];
+                if (!file) {
+                    return;
+                }
+                
+                try {
+                    const fileContent = await file.text();
+                    const accountsData = parseAccountsFile(fileContent);
+                    
+                    if (accountsData.length === 0) {
+                        console.log('Файл не содержит данных аккаунтов');
+                        return;
+                    }
+                    
+                    let successCount = 0;
+                    let errorCount = 0;
+                    
+                    for (const accountData of accountsData) {
+                        try {
+                            const response = await fetch(`/api/ferm/admin/users/${userId}/accounts`, {
+                                method: 'POST',
+                                headers: { 'Content-Type': 'application/json' },
+                                credentials: 'include',
+                                body: JSON.stringify({
+                                    name: accountData.name,
+                                    apiKey: accountData.apiKey,
+                                    apiSecret: accountData.apiSecret,
+                                    webToken: accountData.webToken
+                                })
+                            });
+                            
+                            const result = await response.json();
+                            
+                            if (result.success) {
+                                successCount++;
+                            } else {
+                                errorCount++;
+                            }
+                        } catch (error) {
+                            errorCount++;
+                        }
+                    }
+                    
+                    // Обновляем список пользователей
+                    await loadUsers();
+                    
+                    console.log(`Импорт завершен для пользователя "${username}": успешно ${successCount}, ошибок ${errorCount}`);
+                } catch (error) {
+                    console.error(`Ошибка импорта: ${error.message}`);
+                }
+            };
+            
+            fileInput.click();
+        }
+
+        // Парсинг файла с аккаунтами
+        function parseAccountsFile(fileContent) {
+            const accounts = [];
+            
+            // Разделяем по двойным переносам строк (пустая строка между аккаунтами)
+            const sections = fileContent.split(/\n\n+/).filter(section => section.trim().length > 0);
+            
+            sections.forEach(section => {
+                const lines = section.split('\n').map(line => line.trim()).filter(line => line.length > 0);
+                
+                if (lines.length < 4) {
+                    return;
+                }
+                
+                const name = lines[0] || '';
+                const apiKey = lines[1] || '';
+                const apiSecret = lines[2] || '';
+                const webToken = lines[3] || '';
+                
+                if (name && webToken) {
+                    accounts.push({
+                        name,
+                        apiKey,
+                        apiSecret,
+                        webToken
+                    });
+                }
+            });
+            
+            // Если не нашли разделители, пытаемся парсить как последовательность по 4 строки
+            if (accounts.length === 0) {
+                const allLines = fileContent.split('\n').map(line => line.trim()).filter(line => line.length > 0);
+                
+                for (let i = 0; i < allLines.length; i += 4) {
+                    if (i + 3 < allLines.length) {
+                        const name = allLines[i] || '';
+                        const apiKey = allLines[i + 1] || '';
+                        const apiSecret = allLines[i + 2] || '';
+                        const webToken = allLines[i + 3] || '';
+                        
+                        if (name && webToken) {
+                            accounts.push({
+                                name,
+                                apiKey,
+                                apiSecret,
+                                webToken
+                            });
+                        }
+                    }
+                }
+            }
+            
+            return accounts;
+        }
+
+        // Загружаем данные при загрузке страницы
+        loadCurrentUser();
+        loadUsers();
+    </script>
+</body>
+</html>

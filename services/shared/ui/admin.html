@@ -1,0 +1,467 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Админ-панель</title>
+    <link rel="stylesheet" href="/ferm/styles.css">
+    <style>
+        .btn-success { background: #22c55e; }
+        .btn-danger { background: #ef4444; }
+        .btn-secondary { background: #64748b; }
+        .btn-info { background: #3b82f6; }
+        .btn-warning { background: #f59e0b; }
+        .btn-primary { background: #3b82f6; }
+        button { padding: 8px 16px; border: none; border-radius: 6px; color: white; cursor: pointer; font-size: 14px; }
+        button:hover { opacity: 0.9; }
+    </style>
+    <style>
+        body {
+            background: #0f172a;
+            color: #f1f5f9;
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+        }
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 20px;
+        }
+        header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 24px;
+            padding-bottom: 16px;
+            border-bottom: 1px solid #334155;
+        }
+        h1 {
+            color: #f1f5f9;
+            margin: 0;
+        }
+        .section {
+            background: #1e293b;
+            border: 1px solid #334155;
+            border-radius: 8px;
+            padding: 20px;
+            margin-bottom: 20px;
+        }
+        .section h2 {
+            color: #60a5fa;
+            margin-top: 0;
+            margin-bottom: 16px;
+        }
+        .user-item {
+            padding: 12px;
+            border-bottom: 1px solid #334155;
+            margin-bottom: 8px;
+        }
+        .user-item:last-child {
+            border-bottom: none;
+        }
+        .btn-small {
+            padding: 4px 12px;
+            font-size: 11px;
+        }
+        .bot-status {
+            padding: 12px;
+            background: #0f172a;
+            border: 1px solid #334155;
+            border-radius: 6px;
+            margin-bottom: 12px;
+        }
+        .bot-status.active {
+            border-color: #22c55e;
+        }
+        .bot-status.queued {
+            border-color: #f59e0b;
+        }
+        .queue-item {
+            padding: 8px;
+            background: #0f172a;
+            border: 1px solid #334155;
+            border-radius: 4px;
+            margin-bottom: 8px;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>🔐 Админ-панель</h1>
+            <div style="display: flex; align-items: center; gap: 16px;">
+                <span id="currentUsername" style="color: #94a3b8; font-size: 12px;"></span>
+                <button class="btn-danger" onclick="logout()" style="padding: 6px 12px; font-size: 12px;">Выйти</button>
+            </div>
+        </header>
+
+        <!-- Статус Flipbot -->
+        <section class="section">
+            <h2>🤖 Статус Flipbot</h2>
+            <div id="botStatus" class="bot-status">
+                <div>Загрузка...</div>
+            </div>
+            <button class="btn-danger btn-small" onclick="forceStopBot()" style="display: none;" id="forceStopBtn">Принудительно остановить</button>
+        </section>
+
+        <!-- Очередь пользователей -->
+        <section class="section">
+            <h2>📋 Очередь пользователей Flipbot</h2>
+            <div id="queueList"></div>
+        </section>
+
+        <!-- Управление пользователями -->
+        <section class="section">
+            <h2>👥 Управление пользователями</h2>
+            <form id="createUserForm" style="margin-bottom: 20px;">
+                <div style="display: grid; grid-template-columns: 1fr 1fr 1fr auto; gap: 8px; margin-bottom: 12px;">
+                    <input type="text" id="newUsername" placeholder="Логин" required style="padding: 8px; background: #0f172a; border: 1px solid #334155; border-radius: 4px; color: #f1f5f9;">
+                    <input type="password" id="newPassword" placeholder="Пароль" required style="padding: 8px; background: #0f172a; border: 1px solid #334155; border-radius: 4px; color: #f1f5f9;">
+                    <select id="newUserRole" style="padding: 8px; background: #0f172a; border: 1px solid #334155; border-radius: 4px; color: #f1f5f9;">
+                        <option value="user">Пользователь</option>
+                        <option value="admin">Администратор</option>
+                    </select>
+                    <button type="submit" class="btn-success btn-small">Создать</button>
+                </div>
+            </form>
+            <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 20px;">
+                <div>
+                    <h3 style="color: #60a5fa; margin-bottom: 12px;">🌾 Ferm</h3>
+                    <div id="usersListFerm"></div>
+                </div>
+                <div>
+                    <h3 style="color: #60a5fa; margin-bottom: 12px;">🤖 Flipbot</h3>
+                    <div id="usersListFlipbot"></div>
+                </div>
+            </div>
+        </section>
+    </div>
+
+    <script>
+        let currentUser = null;
+
+        async function loadCurrentUser() {
+            try {
+                const response = await fetch('/api/ferm/auth/check', { credentials: 'include' });
+                const result = await response.json();
+                if (result.success && result.authenticated) {
+                    currentUser = result.data;
+                    document.getElementById('currentUsername').textContent = currentUser.username;
+                } else {
+                    window.location.href = '/ferm/login';
+                }
+            } catch (error) {
+                console.error('Ошибка проверки сессии:', error);
+                window.location.href = '/ferm/login';
+            }
+        }
+
+        async function loadBotStatus() {
+            try {
+                const response = await fetch('/api/admin/bot-status', { credentials: 'include' });
+                const result = await response.json();
+                if (result.success) {
+                    const statusDiv = document.getElementById('botStatus');
+                    const forceStopBtn = document.getElementById('forceStopBtn');
+                    
+                    if (result.data.locked) {
+                        statusDiv.className = 'bot-status active';
+                        statusDiv.innerHTML = `
+                            <div><strong>Текущий пользователь:</strong> ${result.data.currentUsername || 'Неизвестно'}</div>
+                            <div><strong>Время запуска:</strong> ${new Date(result.data.startTime).toLocaleString('ru-RU')}</div>
+                        `;
+                        forceStopBtn.style.display = 'inline-block';
+                    } else {
+                        statusDiv.className = 'bot-status';
+                        statusDiv.innerHTML = '<div>Бот не запущен</div>';
+                        forceStopBtn.style.display = 'none';
+                    }
+                }
+            } catch (error) {
+                console.error('Ошибка загрузки статуса бота:', error);
+            }
+        }
+
+        async function loadQueue() {
+            try {
+                const response = await fetch('/api/admin/bot-queue', { credentials: 'include' });
+                const result = await response.json();
+                if (result.success) {
+                    const queueList = document.getElementById('queueList');
+                    if (result.data.queue && result.data.queue.length > 0) {
+                        queueList.innerHTML = result.data.queue.map((item, index) => `
+                            <div class="queue-item">
+                                <strong>${index + 1}.</strong> ${item.username} (добавлен: ${new Date(item.addedAt).toLocaleString('ru-RU')})
+                            </div>
+                        `).join('');
+                    } else {
+                        queueList.innerHTML = '<div style="color: #94a3b8;">Очередь пуста</div>';
+                    }
+                }
+            } catch (error) {
+                console.error('Ошибка загрузки очереди:', error);
+            }
+        }
+
+        async function loadUsers() {
+            try {
+                const response = await fetch('/api/admin/users-data', { credentials: 'include' });
+                const result = await response.json();
+                if (result.success) {
+                    const usersListFerm = document.getElementById('usersListFerm');
+                    const usersListFlipbot = document.getElementById('usersListFlipbot');
+                    
+                    usersListFerm.innerHTML = result.data.map(user => `
+                        <div class="user-item" data-user-id="${user.id}">
+                            <div style="display: flex; justify-content: space-between; align-items: start;">
+                                <div style="flex: 1;">
+                                    <div style="color: #f1f5f9; font-weight: 600; margin-bottom: 4px;">
+                                        ${user.username} ${user.role === 'admin' ? '(Админ)' : ''}
+                                    </div>
+                                    <div style="color: #94a3b8; font-size: 12px; margin-bottom: 4px;">
+                                        Аккаунтов: ${user.ferm.accountsCount}
+                                    </div>
+                                    <div style="color: #64748b; font-size: 11px;">
+                                        Создан: ${new Date(user.createdAt).toLocaleString('ru-RU')}
+                                    </div>
+                                </div>
+                                <div style="display: flex; gap: 8px; flex-direction: column;">
+                                    <button class="btn-info btn-small" onclick="checkFermBalances('${user.id}', '${user.username}', event)">Балансы</button>
+                                    <button class="btn-success btn-small" onclick="exportFermAccounts('${user.id}', '${user.username}')">Экспорт</button>
+                                    <button class="btn-warning btn-small" onclick="importFermAccounts('${user.id}', '${user.username}')">Импорт</button>
+                                    ${user.role !== 'admin' ? `
+                                        <button class="btn-danger btn-small" onclick="deleteUser('${user.id}', '${user.username}')">Удалить</button>
+                                    ` : ''}
+                                </div>
+                            </div>
+                        </div>
+                    `).join('');
+                    
+                    usersListFlipbot.innerHTML = result.data.map(user => `
+                        <div class="user-item" data-user-id="${user.id}">
+                            <div style="display: flex; justify-content: space-between; align-items: start;">
+                                <div style="flex: 1;">
+                                    <div style="color: #f1f5f9; font-weight: 600; margin-bottom: 4px;">
+                                        ${user.username} ${user.role === 'admin' ? '(Админ)' : ''}
+                                        ${user.flipbot.isBotOwner ? ' <span style="color: #22c55e;">(Торгует)</span>' : ''}
+                                    </div>
+                                    <div style="color: #94a3b8; font-size: 12px; margin-bottom: 4px;">
+                                        Аккаунтов: ${user.flipbot.accountsCount}
+                                    </div>
+                                    ${user.flipbot.config ? `
+                                        <div style="color: #64748b; font-size: 11px; margin-bottom: 2px;">
+                                            Мультиаккаунтинг: ${user.flipbot.config.enabled ? 'Включен' : 'Выключен'}
+                                        </div>
+                                    ` : ''}
+                                    <div style="color: #64748b; font-size: 11px;">
+                                        Создан: ${new Date(user.createdAt).toLocaleString('ru-RU')}
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    `).join('');
+                }
+            } catch (error) {
+                console.error('Ошибка загрузки пользователей:', error);
+            }
+        }
+        
+        async function checkFermBalances(userId, username, event) {
+            try {
+                const button = event?.target || document.querySelector(`button[onclick*="checkFermBalances('${userId}'"]`);
+                if (button) {
+                    button.disabled = true;
+                    button.textContent = 'Проверка...';
+                }
+                
+                const response = await fetch(`/api/ferm/admin/users/${userId}/check-balances`, {
+                    method: 'POST',
+                    credentials: 'include'
+                });
+                
+                if (!response.ok) {
+                    throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+                }
+                
+                const result = await response.json();
+                
+                if (button) {
+                    button.disabled = false;
+                    button.textContent = 'Балансы';
+                }
+                
+                if (result.success) {
+                    if (result.data && result.data.balances && result.data.balances.length > 0) {
+                        const balancesText = result.data.balances.map(b => `${b.name}: ${b.balance.toFixed(2)} USDT`).join('\n');
+                        const summary = `Обработано: ${result.data.processed || 0}${result.data.errors ? `, ошибок: ${result.data.errors}` : ''}`;
+                        alert(`Балансы для ${username}:\n\n${balancesText}\n\n${summary}`);
+                    } else {
+                        alert(`У пользователя ${username} нет аккаунтов или балансы не получены`);
+                    }
+                } else {
+                    alert('Ошибка: ' + (result.error || 'Неизвестная ошибка'));
+                }
+            } catch (error) {
+                console.error('Ошибка проверки балансов:', error);
+                const button = event?.target || document.querySelector(`button[onclick*="checkFermBalances('${userId}'"]`);
+                if (button) {
+                    button.disabled = false;
+                    button.textContent = 'Балансы';
+                }
+                alert('Ошибка проверки балансов: ' + (error.message || 'Неизвестная ошибка'));
+            }
+        }
+        
+        async function exportFermAccounts(userId, username) {
+            try {
+                const response = await fetch(`/api/ferm/admin/users/${userId}/accounts/export`, {
+                    credentials: 'include'
+                });
+                const result = await response.json();
+                if (result.success) {
+                    const blob = new Blob([result.data], { type: 'text/plain' });
+                    const url = URL.createObjectURL(blob);
+                    const a = document.createElement('a');
+                    a.href = url;
+                    a.download = `ferm-accounts-${username}.txt`;
+                    a.click();
+                    URL.revokeObjectURL(url);
+                } else {
+                    alert('Ошибка: ' + result.error);
+                }
+            } catch (error) {
+                console.error('Ошибка экспорта:', error);
+                alert('Ошибка экспорта');
+            }
+        }
+        
+        async function importFermAccounts(userId, username) {
+            const input = document.createElement('input');
+            input.type = 'file';
+            input.accept = '.txt';
+            input.onchange = async (e) => {
+                const file = e.target.files[0];
+                if (!file) return;
+                
+                const text = await file.text();
+                try {
+                    const response = await fetch(`/api/ferm/admin/users/${userId}/accounts/import`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        credentials: 'include',
+                        body: JSON.stringify({ data: text })
+                    });
+                    const result = await response.json();
+                    if (result.success) {
+                        alert(`Импортировано аккаунтов: ${result.data.added || 0}`);
+                        loadUsers();
+                    } else {
+                        alert('Ошибка: ' + result.error);
+                    }
+                } catch (error) {
+                    console.error('Ошибка импорта:', error);
+                    alert('Ошибка импорта');
+                }
+            };
+            input.click();
+        }
+
+        async function forceStopBot() {
+            if (!confirm('Вы уверены, что хотите принудительно остановить бот?')) {
+                return;
+            }
+            try {
+                const response = await fetch('/api/admin/bot-force-stop', {
+                    method: 'POST',
+                    credentials: 'include'
+                });
+                const result = await response.json();
+                if (result.success) {
+                    alert('Бот остановлен');
+                    loadBotStatus();
+                    loadQueue();
+                } else {
+                    alert('Ошибка: ' + result.error);
+                }
+            } catch (error) {
+                console.error('Ошибка остановки бота:', error);
+                alert('Ошибка остановки бота');
+            }
+        }
+
+        async function deleteUser(userId, username) {
+            if (!confirm(`Вы уверены, что хотите удалить пользователя "${username}"?`)) {
+                return;
+            }
+            try {
+                const response = await fetch(`/api/ferm/admin/users/${userId}`, {
+                    method: 'DELETE',
+                    credentials: 'include'
+                });
+                const result = await response.json();
+                if (result.success) {
+                    loadUsers();
+                } else {
+                    alert('Ошибка: ' + result.error);
+                }
+            } catch (error) {
+                console.error('Ошибка удаления пользователя:', error);
+                alert('Ошибка удаления пользователя');
+            }
+        }
+
+        document.getElementById('createUserForm').addEventListener('submit', async (e) => {
+            e.preventDefault();
+            const username = document.getElementById('newUsername').value.trim();
+            const password = document.getElementById('newPassword').value;
+            const role = document.getElementById('newUserRole').value;
+
+            if (!username || !password) {
+                alert('Заполните все поля');
+                return;
+            }
+
+            try {
+                const response = await fetch('/api/ferm/admin/users', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    credentials: 'include',
+                    body: JSON.stringify({ username, password, role })
+                });
+                const result = await response.json();
+                if (result.success) {
+                    document.getElementById('createUserForm').reset();
+                    loadUsers();
+                } else {
+                    alert('Ошибка: ' + result.error);
+                }
+            } catch (error) {
+                console.error('Ошибка создания пользователя:', error);
+                alert('Ошибка создания пользователя');
+            }
+        });
+
+        async function logout() {
+            try {
+                await fetch('/api/ferm/auth/logout', { method: 'POST', credentials: 'include' });
+                window.location.href = '/ferm/login';
+            } catch (error) {
+                console.error('Ошибка выхода:', error);
+            }
+        }
+
+        // Инициализация
+        (async () => {
+            await loadCurrentUser();
+            await loadBotStatus();
+            await loadQueue();
+            await loadUsers();
+            
+            // Обновляем статус каждые 5 секунд
+            setInterval(() => {
+                loadBotStatus();
+                loadQueue();
+            }, 5000);
+        })();
+    </script>
+</body>
+</html>

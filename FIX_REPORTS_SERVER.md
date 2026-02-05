@@ -70,3 +70,11 @@ pm2 status
 ls -la /root/unified-bot/dist/server.js
 ```
 
+
+
+
+
+
+
+
+

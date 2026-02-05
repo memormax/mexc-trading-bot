@@ -6,7 +6,8 @@ let currentAsk = 0;
 let pricePrecision = 8; // Точность цены по умолчанию
 let volumePrecision = 8; // Точность объема по умолчанию
 let authTokenSet = false;
-const API_BASE_URL = window.location.origin; // Используем текущий домен
+// API всегда использует корневой путь, независимо от того, где находится страница
+const API_BASE_URL = window.location.origin; // API запросы всегда идут на корневой путь
 // Хранилище цен для всех символов (для расчета PnL)
 const symbolPrices = {}; // {symbol: price}
 // Хранилище contractSize для всех символов
@@ -2549,4 +2550,3 @@ async function loadMultiAccountStatus() {
 window.addEventListener('load', () => {
     startTradeHistoryAutoUpdate();
 });
-

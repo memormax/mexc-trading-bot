@@ -137,25 +137,57 @@ export async function getFeeRate() {
   return await client.getFeeRate();
 }
 
+// Публичные методы - не требуют токена, используем прямой HTTP запрос к публичному API
 export async function getTicker(symbol: string) {
-  if (!client) {
-    throw new Error('Client not initialized. Please set auth token first.');
+  // Публичный API MEXC не требует токена
+  // Правильный формат: GET /api/v1/contract/ticker?symbol={symbol}
+  const axios = require('axios');
+  try {
+    const response = await axios.get(`https://contract.mexc.com/api/v1/contract/ticker?symbol=${symbol}`, {
+      timeout: 10000,
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+      }
+    });
+    return response.data;
+  } catch (error: any) {
+    console.error(`[TRADING] Error getting ticker for ${symbol}:`, error.message);
+    console.error(`[TRADING] Response status:`, error.response?.status);
+    console.error(`[TRADING] Response data:`, error.response?.data);
+    throw error;
   }
-  return await client.getTicker(symbol);
 }
 
 export async function getContractDetail(symbol?: string) {
-  if (!client) {
-    throw new Error('Client not initialized. Please set auth token first.');
+  // Публичный API MEXC не требует токена
+  const axios = require('axios');
+  try {
+    const url = symbol 
+      ? `https://contract.mexc.com/api/v1/contract/detail?symbol=${symbol}`
+      : 'https://contract.mexc.com/api/v1/contract/detail';
+    const response = await axios.get(url, {
+      timeout: 10000
+    });
+    return response.data;
+  } catch (error: any) {
+    console.error(`[TRADING] Error getting contract detail for ${symbol}:`, error.message);
+    throw error;
   }
-  return await client.getContractDetail(symbol);
 }
 
 export async function getContractDepth(symbol: string, limit?: number) {
-  if (!client) {
-    throw new Error('Client not initialized. Please set auth token first.');
+  // Публичный API MEXC не требует токена
+  const axios = require('axios');
+  try {
+    const url = `https://contract.mexc.com/api/v1/contract/depth/${symbol}${limit ? `?limit=${limit}` : ''}`;
+    const response = await axios.get(url, {
+      timeout: 10000
+    });
+    return response.data;
+  } catch (error: any) {
+    console.error(`[TRADING] Error getting contract depth for ${symbol}:`, error.message);
+    throw error;
   }
-  return await client.getContractDepth(symbol, limit);
 }
 
 export async function modifyLeverage(symbol: string, leverage: number, positionId?: number) {
@@ -230,6 +262,14 @@ export async function modifyLeverage(symbol: string, leverage: number, positionI
     throw error;
   }
 }
+
+
+
+
+
+
+
+
 
 
 

@@ -1,0 +1,357 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>MEXC Futures Trading Bot</title>
+    <link rel="stylesheet" href="/flip/styles.css">
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>Флипбот</h1>
+            <div style="display: flex; align-items: center; gap: 16px;">
+                <div class="connection-status" id="connectionStatus">
+                    <span class="status-dot"></span>
+                    <span>Не подключено</span>
+                </div>
+                <span id="currentUsername" style="color: #94a3b8; font-size: 12px;"></span>
+                <button class="btn-secondary" onclick="window.open('/', '_blank')" style="padding: 6px 12px; font-size: 12px;">Главная</button>
+                <button id="adminPanelButton" class="btn-secondary" onclick="openAdminPanel()" style="padding: 6px 12px; font-size: 12px; display: none;">Админ-панель</button>
+                <button class="btn-danger" onclick="logout()" style="padding: 6px 12px; font-size: 12px;">Выйти</button>
+            </div>
+        </header>
+
+        <div class="main-content">
+            <!-- Первый столбец: Статус арбитража, Монета, Текущий спред -->
+            <div class="left-panel">
+                <!-- Статус арбитража -->
+                <section class="card">
+                    <h2>🔌 Статус арбитража</h2>
+                    <div id="arbitrageStatus" class="info-display">
+                        <p>Бот не запущен</p>
+                    </div>
+                    <div class="action-buttons" style="margin-top: 8px;">
+                        <button class="btn-success" onclick="startArbitrageBot()">▶️ Запустить</button>
+                        <button class="btn-danger" onclick="stopArbitrageBot()">⏹️ Остановить</button>
+                        <button class="btn-warning" onclick="restartArbitrageBot()">🔄 Перезапустить</button>
+                    </div>
+                    <div class="action-buttons" style="margin-top: 8px;">
+                        <button class="btn-secondary" onclick="restartServer()" style="width: 100%;">🔄 Перезагрузить сервер</button>
+                    </div>
+                </section>
+
+                <!-- Выбор монеты -->
+                <section class="card">
+                    <h2>📊 Монета</h2>
+                    <div class="form-group">
+                        <label for="customSymbol">Символ:</label>
+                        <input type="text" id="customSymbol" value="UNI" placeholder="UNI или UNI_USDT" />
+                        <div style="font-size: 11px; color: #94a3b8; margin-top: 4px;">
+                            Можно ввести просто название монеты (например, SHIB), автоматически добавится _USDT
+                        </div>
+                    </div>
+                    <button class="btn-primary" onclick="saveSymbol()" style="width: 100%; margin-top: 8px;">💾 Сохранить</button>
+                </section>
+
+                <!-- Текущий спред -->
+                <section class="card">
+                    <h2>📊 Текущий спред <button class="btn-small refresh-btn" onclick="updateSpread()" style="margin: 0; padding: 2px 6px;">🔄</button></h2>
+                    <div id="spreadInfo" class="info-display">
+                        <p>Ожидание данных...</p>
+                    </div>
+                </section>
+            </div>
+
+            <!-- Второй столбец: Мультиаккаунтинг, Параметры ордера, Быстрые действия -->
+            <div class="middle-panel">
+                <!-- Мультиаккаунтинг -->
+                <section class="card" id="multiAccountSection">
+                    <h2>👥 Мультиаккаунтинг</h2>
+                    
+                    <!-- Настройки мультиаккаунтинга -->
+                    <div style="margin-bottom: 20px; padding: 12px; background: #1e293b; border: 1px solid #334155; border-radius: 4px;">
+                        <h3 style="margin-top: 0; font-size: 14px; color: #60a5fa;">⚙️ Настройки переключения</h3>
+                        <div class="form-group">
+                            <label for="multiAccountTargetBalance">Финальный баланс (USDT):</label>
+                            <input type="number" id="multiAccountTargetBalance" value="0" min="0" step="0.01" />
+                            <div style="font-size: 11px; color: #94a3b8; margin-top: 4px;">
+                                Если баланс на текущем аккаунте достигнет этой суммы, бот переключится на следующий аккаунт.
+                            </div>
+                        </div>
+                        <div class="form-group">
+                            <label for="multiAccountMaxTime">Время торговли (минуты):</label>
+                            <input type="number" id="multiAccountMaxTime" value="0" min="0" step="1" />
+                            <div style="font-size: 11px; color: #94a3b8; margin-top: 4px;">
+                                Максимальное время торговли на одном аккаунте. После истечения времени бот переключится на следующий аккаунт.
+                            </div>
+                        </div>
+                        <div class="form-group">
+                            <label for="tradeTimeoutSeconds">Таймаут между сделками (секунды):</label>
+                            <input type="number" id="tradeTimeoutSeconds" value="0" min="0" step="0.1" />
+                            <div style="font-size: 11px; color: #94a3b8; margin-top: 4px;">
+                                Пауза между сделками. Например, если указать 1, то между каждой сделкой будет пауза 1 секунда.
+                            </div>
+                        </div>
+                        <button class="btn-primary" onclick="saveMultiAccountConfig()" style="width: 100%;">💾 Сохранить настройки</button>
+                    </div>
+                    
+                    <!-- Список аккаунтов -->
+                    <div style="margin-bottom: 20px;">
+                        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px;">
+                            <h3 style="margin: 0; font-size: 14px; color: #60a5fa;">📋 Аккаунты</h3>
+                            <div style="display: flex; gap: 8px;">
+                                <button class="btn-warning" onclick="importMultiAccounts()" style="padding: 4px 12px; font-size: 12px;">📥 Импорт</button>
+                                <button class="btn-success" onclick="addMultiAccount()" style="padding: 4px 12px; font-size: 12px;">➕ Добавить аккаунт</button>
+                            </div>
+                        </div>
+                        <input type="file" id="importMultiAccountFileInput" accept=".txt" style="display: none;" onchange="handleMultiAccountFileImport(event)">
+                        <div id="multiAccountList" style="display: flex; flex-direction: column; gap: 12px;">
+                            <div style="padding: 12px; background: #1e293b; border: 1px solid #334155; border-radius: 4px; text-align: center; color: #94a3b8; font-size: 12px;">
+                                Нет аккаунтов. Нажмите "Добавить аккаунт" для начала.
+                            </div>
+                        </div>
+                    </div>
+                    
+                    <!-- Статус и логи -->
+                    <div style="margin-top: 20px; padding-top: 20px; border-top: 1px solid #334155;">
+                        <h3 style="margin-top: 0; font-size: 14px; color: #60a5fa;">📊 Статус</h3>
+                        <div id="multiAccountStatus" style="padding: 12px; background: #1e293b; border: 1px solid #334155; border-radius: 4px; font-size: 12px; color: #94a3b8;">
+                            Загрузка статуса...
+                        </div>
+                        <button class="btn-secondary" onclick="loadMultiAccountStatus()" style="width: 100%; margin-top: 8px; padding: 6px;">🔄 Обновить статус</button>
+                        <button class="btn-primary" onclick="window.open('/reports.html', '_blank')" style="width: 100%; margin-top: 8px; padding: 6px;">📊 Показать отчет</button>
+                    </div>
+                </section>
+
+                <!-- Параметры торговли -->
+                <section class="card">
+                    <h2 style="cursor: pointer; user-select: none;" onclick="toggleSection('orderParamsContent', 'orderParamsToggle')">
+                        ⚙️ Параметры ордера
+                        <span id="orderParamsToggle" style="float: right; font-size: 12px; color: #94a3b8;">▼</span>
+                    </h2>
+                    
+                    <div id="orderParamsContent" class="collapsible-content">
+                    <div class="form-group" style="display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 6px;">
+                        <div>
+                            <label for="orderSide">Направление:</label>
+                            <select id="orderSide" onchange="updateOrderSideHint()">
+                                <option value="1">📈 Открыть лонг</option>
+                                <option value="3">📉 Открыть шорт</option>
+                                <option value="4">🔒 Закрыть лонг</option>
+                                <option value="2">🔒 Закрыть шорт</option>
+                            </select>
+                        </div>
+                        <div>
+                            <label for="orderType">Тип:</label>
+                            <select id="orderType" onchange="updateOrderTypeHint()">
+                                <option value="5">⚡ Market</option>
+                                <option value="1">📊 Limit</option>
+                                <option value="3">⏱️ IOC</option>
+                                <option value="4">🎯 FOK</option>
+                                <option value="2">📝 Post Only</option>
+                                <option value="6">🔄 Convert</option>
+                            </select>
+                        </div>
+                        <div>
+                            <label for="openType">Маржа:</label>
+                            <select id="openType" onchange="updateVolumeCalculations()">
+                                <option value="1">Isolated</option>
+                                <option value="2">Cross</option>
+                            </select>
+                        </div>
+                    </div>
+                    <div id="orderHint" class="hint" style="margin-top: 4px; padding: 4px 6px; background: #1e293b; border: 1px solid #334155; border-radius: 4px; font-size: 11px; color: #60a5fa;"></div>
+
+                    <div class="form-group" style="display: grid; grid-template-columns: 1fr 1fr; gap: 6px;">
+                        <div>
+                            <label for="leverage">Плечо:</label>
+                            <div style="display: flex; gap: 4px;">
+                                <input type="number" id="leverage" min="1" max="125" value="10" onchange="updateVolumeCalculations()" style="flex: 1;" />
+                                <button class="btn-small" onclick="applyLeverage()" style="margin: 0; white-space: nowrap; padding: 4px 8px;">Применить</button>
+                            </div>
+                        </div>
+                        <div>
+                            <label for="price">Цена: <span id="priceHint" style="font-size: 10px; color: white;">(Market: 0)</span></label>
+                            <div style="display: flex; gap: 4px;">
+                                <input type="number" id="price" step="0.01" placeholder="Авто" oninput="updateVolumeCalculations()" style="flex: 1;" />
+                                <button class="btn-small" onclick="setCurrentPrice()" style="margin: 0; padding: 4px 8px;">📌</button>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="form-group">
+                        <label>Объем:</label>
+                        <div style="display: flex; gap: 6px; margin-bottom: 4px; align-items: center;">
+                            <label style="display: flex; align-items: center; gap: 4px; cursor: pointer; font-size: 12px; margin: 0;">
+                                <input type="radio" name="volumeType" value="usdt" checked onchange="updateVolumeType()" />
+                                <span>USDT</span>
+                            </label>
+                            <label style="display: flex; align-items: center; gap: 4px; cursor: pointer; font-size: 12px; margin: 0;">
+                                <input type="radio" name="volumeType" value="coins" onchange="updateVolumeType()" />
+                                <span>Коины</span>
+                            </label>
+                            <div style="flex: 1; display: flex; gap: 4px; justify-content: flex-end;">
+                                <button class="btn-small" onclick="setVolumePercent(25)" style="margin: 0; padding: 2px 6px; font-size: 10px;">25%</button>
+                                <button class="btn-small" onclick="setVolumePercent(50)" style="margin: 0; padding: 2px 6px; font-size: 10px;">50%</button>
+                                <button class="btn-small" onclick="setVolumePercent(100)" style="margin: 0; padding: 2px 6px; font-size: 10px;">100%</button>
+                            </div>
+                        </div>
+                        <div style="display: flex; gap: 4px; align-items: center;">
+                            <input type="number" id="volume" step="0.001" placeholder="0.001" oninput="updateVolumeCalculations()" style="flex: 1;" />
+                            <span id="volumeUnit" style="font-size: 11px; color: white; margin-left: 4px; white-space: nowrap;">USDT</span>
+                        </div>
+                        <div id="volumeCalculations" style="margin-top: 4px; padding: 4px 6px; background: #1e293b; border: 1px solid #334155; border-radius: 4px; font-size: 11px; color: #60a5fa;">
+                            <div>Расчеты появятся после ввода объема</div>
+                        </div>
+                    </div>
+
+                    <div class="form-group" style="display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 6px;">
+                        <div>
+                            <label for="stopLossPrice">Стоп-лосс:</label>
+                            <input type="number" id="stopLossPrice" step="0.01" placeholder="Опц." />
+                        </div>
+                        <div>
+                            <label for="takeProfitPrice">Тейк-профит:</label>
+                            <input type="number" id="takeProfitPrice" step="0.01" placeholder="Опц." />
+                        </div>
+                        <div>
+                            <label for="positionMode">Режим:</label>
+                            <select id="positionMode">
+                                <option value="">По умолчанию</option>
+                                <option value="1">Hedge</option>
+                                <option value="2">One-way</option>
+                            </select>
+                        </div>
+                    </div>
+
+                    <div class="form-group" style="display: grid; grid-template-columns: 1fr 1fr; gap: 6px;">
+                        <div>
+                            <label for="positionId">Position ID:</label>
+                            <input type="number" id="positionId" placeholder="Опц." />
+                        </div>
+                        <div style="display: flex; align-items: flex-end; gap: 6px;">
+                            <label style="margin: 0; display: flex; align-items: center; cursor: pointer; flex: 1;">
+                                <input type="checkbox" id="reduceOnly" style="margin-right: 4px;" />
+                                <span style="font-size: 11px;">Reduce Only</span>
+                            </label>
+                            <div style="flex: 1;">
+                                <label for="externalOid" style="font-size: 11px;">External ID:</label>
+                                <input type="text" id="externalOid" placeholder="Опц." style="font-size: 11px;" />
+                            </div>
+                        </div>
+                    </div>
+                    </div>
+                </section>
+
+                <!-- Быстрые действия -->
+                <section class="card">
+                    <h2 style="cursor: pointer; user-select: none;" onclick="toggleSection('quickActionsContent', 'quickActionsToggle')">
+                        ⚡ Быстрые действия
+                        <span id="quickActionsToggle" style="float: right; font-size: 12px; color: #94a3b8;">▼</span>
+                    </h2>
+                    <div id="quickActionsContent" class="collapsible-content">
+                    <div class="quick-actions">
+                        <button class="btn-success quick-btn" onclick="quickLong()">📈 ЛОНГ</button>
+                        <button class="btn-danger quick-btn" onclick="quickShort()">📉 ШОРТ</button>
+                        <button class="btn-warning quick-btn" onclick="quickClose()">🔒 Закрыть</button>
+                    </div>
+                    <div style="margin-top: 8px; padding-top: 8px; border-top: 1px solid #334155;">
+                        <div class="action-buttons">
+                            <button class="btn-success" onclick="submitOrder()">📈 Создать ордер</button>
+                            <button class="btn-danger" onclick="cancelAllOrders()">❌ Отменить все</button>
+                        </div>
+                    </div>
+                    </div>
+                </section>
+            </div>
+
+            <!-- Третий столбец: Настройки арбитража -->
+            <div class="right-panel">
+                <!-- Настройки арбитража -->
+                <section class="card">
+                    <h2>⚙️ Настройки арбитража</h2>
+                    <div class="form-group">
+                        <label for="minTicks">Минимальная разница (тики):</label>
+                        <input type="number" id="minTicks" value="2" min="1" />
+                    </div>
+                    <div class="form-group">
+                        <label for="maxSlippage">Макс. проскальзывание (%):</label>
+                        <input type="number" id="maxSlippage" value="0.1" step="0.01" min="0" />
+                        <div style="font-size: 11px; color: #94a3b8; margin-top: 4px;">
+                            Максимальное отклонение цены исполнения от ожидаемой. Защита от больших потерь при недостаточной ликвидности.
+                        </div>
+                    </div>
+                    
+                    <div style="margin-top: 16px; padding-top: 16px; border-top: 1px solid #334155;">
+                        <div class="form-group">
+                            <label for="autoLeverage">Авто плечо:</label>
+                            <input type="number" id="autoLeverage" value="10" min="1" max="125" />
+                            <div style="font-size: 11px; color: #94a3b8; margin-top: 4px;">
+                                Плечо, которое будет использоваться при запуске торгового бота.
+                            </div>
+                        </div>
+                    </div>
+                    
+                    <div style="margin-top: 16px; padding-top: 16px; border-top: 1px solid #334155;">
+                        <div class="form-group">
+                            <label style="display: flex; align-items: center; gap: 8px; cursor: pointer;">
+                                <input type="checkbox" id="autoVolumeEnabled" onchange="toggleAutoVolume()" />
+                                <span><strong>Автообъем</strong></span>
+                            </label>
+                            <div style="font-size: 11px; color: #94a3b8; margin-top: 4px; margin-left: 24px;">
+                                Автоматически регулирует объем в зависимости от баланса счета. Обновляется каждые 3 сделки.
+                            </div>
+                        </div>
+                        
+                        <div id="autoVolumeSettings" style="display: none; margin-top: 12px; padding: 12px; background: #1e293b; border: 1px solid #334155; border-radius: 4px;">
+                            <div class="form-group">
+                                <label for="autoVolumePercent">Процент от баланса (%):</label>
+                                <input type="number" id="autoVolumePercent" value="90" min="1" max="100" step="1" />
+                                <div style="font-size: 11px; color: #94a3b8; margin-top: 4px;">
+                                    Процент от максимально возможного объема (с учетом плеча), который будет использоваться для торговли.
+                                </div>
+                            </div>
+                            <div class="form-group">
+                                <label for="autoVolumeMax">Максимальный объем (USDT):</label>
+                                <input type="number" id="autoVolumeMax" value="3500" min="1" step="1" />
+                                <div style="font-size: 11px; color: #94a3b8; margin-top: 4px;">
+                                    Максимальная сумма для торговли при включенном Автообъеме. Если расчетный объем превысит это значение, будет использоваться максимальный.
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                    
+                    <div style="margin-top: 16px; padding-top: 16px; border-top: 1px solid #334155;">
+                        <div class="form-group">
+                            <label for="marginMode">Маржа:</label>
+                            <select id="marginMode" style="width: 100%; padding: 6px; background: #1e293b; border: 1px solid #334155; border-radius: 4px; color: #e2e8f0;">
+                                <option value="isolated">Изолированная (Isolated)</option>
+                                <option value="cross">Кросс (Cross)</option>
+                            </select>
+                            <div style="font-size: 11px; color: #94a3b8; margin-top: 4px;">
+                                Режим маржи для открытия позиций. <strong>Изолированная:</strong> маржа изолирована для каждой позиции. <strong>Кросс:</strong> общая маржа для всех позиций.
+                            </div>
+                        </div>
+                        <div class="form-group">
+                            <label for="minBalanceForTrading">Минимальная сумма для торговли (USDT):</label>
+                            <input type="number" id="minBalanceForTrading" value="0.5" min="0" step="0.01" />
+                            <div style="font-size: 11px; color: #94a3b8; margin-top: 4px;">
+                                Минимальный баланс на аккаунте для продолжения торговли. Если баланс опустится ниже этого значения, бот переключится на следующий аккаунт (в режиме мультиаккаунтинга) или остановится.
+                            </div>
+                        </div>
+                    </div>
+                    
+                    <div style="font-size: 11px; color: #60a5fa; margin-top: 8px; padding: 6px; background: #1e293b; border: 1px solid #334155; border-radius: 4px;">
+                        <strong>💡 Примечание:</strong> Если Автообъем выключен, объем позиции настраивается в панели <strong>"Параметры ордера"</strong> (поле "Объем" в USDT).
+                    </div>
+                    <button class="btn-primary" onclick="saveArbitrageSettings()">💾 Сохранить</button>
+                </section>
+            </div>
+        </div>
+    </div>
+
+    <script src="/flip/app.js"></script>
+    <script src="/flip/arbitrage-functions.js"></script>
+</body>
+</html>
